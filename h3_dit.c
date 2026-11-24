@@ -91,6 +91,10 @@ struct h3_dit {
     int activation_aliases;
     int fused_patch_projection;
     int fused_patch_pack;
+    float sol_attn_tau;
+    uint32_t sol_scratch_nqb;
+    h3_gpu_tensor *sol_pooled, *sol_scores, *sol_thresholds,
+        *sol_sel_offsets, *sol_sel_indices;
     int token_reduction;
     int token_reduction_active;
     unsigned token_reduction_begin;
@@ -1662,6 +1666,36 @@ static h3_dit *load_dit(const char *weight_directory,
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
          getenv("H3_INT8_MLP_STAGE"));
+    {
+        const char *sol = getenv("H3_SOL_ATTN");
+        dit->sol_attn_tau = sol ? (float)atof(sol) : 0.0f;
+        if (sol && dit->sol_attn_tau <= 0.0f) dit->sol_attn_tau = 1.3f;
+        if (dit->sol_attn_tau > 0.0f && !dit->ssd_streaming &&
+            dit->sequence >= 512u) {
+            uint32_t nqb = (dit->sequence + 127u) / 128u;
+            dit->sol_scratch_nqb = nqb;
+            dit->sol_pooled = h3_gpu_tensor_new_bf16(
+                dit->gpu, (size_t)3u * HEADS * nqb * HEAD_DIM);
+            dit->sol_scores = h3_gpu_tensor_new_f32(
+                dit->gpu, (size_t)HEADS * nqb * nqb);
+            dit->sol_thresholds = h3_gpu_tensor_new_f32(
+                dit->gpu, (size_t)HEADS * nqb);
+            dit->sol_sel_offsets = h3_gpu_tensor_new_i8(
+                dit->gpu, 4u * (size_t)HEADS * (nqb + 1u));
+            dit->sol_sel_indices = h3_gpu_tensor_new_i8(
+                dit->gpu, 4u * (size_t)HEADS * nqb * nqb);
+            if (!dit->sol_pooled || !dit->sol_scores ||
+                !dit->sol_thresholds || !dit->sol_sel_offsets ||
+                !dit->sol_sel_indices) {
+                fail(error, error_size,
+                     "cannot allocate Sol-Attn scratch: %s",
+                     h3_gpu_error(dit->gpu));
+                return 0;
+            }
+        } else {
+            dit->sol_attn_tau = 0.0f;
+        }
+    }
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
@@ -1928,6 +1962,17 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT head-major full attention");
+    else if (dit->sol_attn_tau > 0.0f && dit->sol_scratch_nqb &&
+             !dit->token_reduction_active && rows == dit->sequence &&
+             index >= 2u)
+        OP(h3_gpu_sol_sdpa_bf16(
+            dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
+            rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), 128u,
+            dit->video_target_start, dit->video_target_start + dit->video_rows,
+            dit->sol_attn_tau, dit->sol_pooled, dit->sol_scores,
+            dit->sol_thresholds, dit->sol_sel_offsets,
+            dit->sol_sel_indices),
+           "DiT Sol-Attn block-sparse attention");
     else
         OP(h3_gpu_sdpa_bf16(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
@@ -3033,6 +3078,8 @@ void h3_dit_free(h3_dit *dit) {
     FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(attention_heads); FREE(attention_output);
+    FREE(sol_pooled); FREE(sol_scores); FREE(sol_thresholds);
+    FREE(sol_sel_offsets); FREE(sol_sel_indices);
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(int8_activation);

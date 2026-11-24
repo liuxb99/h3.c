@@ -432,7 +432,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
             @"h3_geglu_f32", @"h3_clip_f32",
             @"h3_vae_encoder_pad_f32",
-            @"h3_vae_encoder_group_norm_silu_f32"
+            @"h3_vae_encoder_group_norm_silu_f32",
+            @"h3_sol_block_pool_bf16", @"h3_sol_block_scores_bf16",
+            @"h3_sol_block_select_bf16", @"h3_sol_attn_bf16"
         ] mutableCopy];
         if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
@@ -1022,6 +1024,14 @@ typedef struct {
 } gqa_args;
 typedef struct { uint32_t sample_offset, elements; float delta, ratio; }
     euler_args;
+typedef struct { uint32_t sequence, heads, block, video_start, video_stop; }
+    sol_pool_args;
+typedef struct { uint32_t nqb, heads, video_first, video_last,
+                 video_start, video_stop; float scale, tau; }
+    sol_scores_args;
+typedef struct { uint32_t sequence, heads, block, nqb, video_start,
+                 video_stop, video_first, video_last; float scale; }
+    sol_attn_args;
 
 static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *input,
@@ -4708,4 +4718,97 @@ int h3_gpu_silu_mul_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
             [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
         });
+}
+
+int h3_gpu_sol_sdpa_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                         const h3_gpu_tensor *value, uint32_t sequence,
+                         uint32_t heads, uint32_t head_dim, float scale,
+                         uint32_t block, uint32_t video_start,
+                         uint32_t video_stop, float tau,
+                         h3_gpu_tensor *pooled, h3_gpu_tensor *scores,
+                         h3_gpu_tensor *thresholds, h3_gpu_tensor *sel_offsets,
+                         h3_gpu_tensor *sel_indices) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || head_dim != 128u || block != 128u ||
+        video_start >= video_stop || video_stop > sequence) {
+        h3_gpu_set_error(gpu, @"Sol-Attn requires head_dim=128, block=128 "
+                              "and a valid video window");
+        return 0;
+    }
+    uint32_t nqb = (sequence + block - 1u) / block;
+    size_t qkv_count = (size_t)sequence * heads * head_dim;
+    size_t pooled_count = (size_t)3u * heads * nqb * 128u;
+    size_t scores_count = (size_t)heads * nqb * nqb;
+    if (!h3_gpu_require_bf16(gpu, query, qkv_count, @"sol query") ||
+        !h3_gpu_require_bf16(gpu, key, qkv_count, @"sol key") ||
+        !h3_gpu_require_bf16(gpu, value, qkv_count, @"sol value") ||
+        !h3_gpu_require_bf16(gpu, output, qkv_count, @"sol output") ||
+        !h3_gpu_require_bf16(gpu, pooled, pooled_count, @"sol pooled") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    uint32_t video_first = (video_start + block - 1u) / block;
+    uint32_t video_last = video_stop / block;
+    if (video_last < video_first) video_last = video_first;
+    sol_pool_args pool_args = {sequence, heads, block, video_start, video_stop};
+    sol_scores_args scores_args = {nqb, heads, video_first, video_last,
+                                   video_start, video_stop, scale, tau};
+    sol_attn_args attn_args = {sequence, heads, block, nqb, video_start,
+                               video_stop, video_first, video_last, scale};
+    NSUInteger scan_threads = 1024u;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pool_pipeline =
+            h3_gpu_pipeline(gpu, @"h3_sol_block_pool_bf16");
+        id<MTLComputePipelineState> scores_pipeline =
+            h3_gpu_pipeline(gpu, @"h3_sol_block_scores_bf16");
+        id<MTLComputePipelineState> select_pipeline =
+            h3_gpu_pipeline(gpu, @"h3_sol_block_select_bf16");
+        id<MTLComputePipelineState> attn_pipeline =
+            h3_gpu_pipeline(gpu, @"h3_sol_attn_bf16");
+        if (!pool_pipeline || !scores_pipeline || !select_pipeline ||
+            !attn_pipeline) return 0;
+        scan_threads = MIN((NSUInteger)1024,
+                           select_pipeline.maxTotalThreadsPerThreadgroup);
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pool_pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(pooled).buffer offset:0 atIndex:3];
+        [encoder setBytes:&pool_args length:sizeof(pool_args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(nqb, heads, 3)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder setComputePipelineState:scores_pipeline];
+        [encoder setBuffer:TENSOR(pooled).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(scores).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(thresholds).buffer offset:0 atIndex:2];
+        [encoder setBytes:&scores_args length:sizeof(scores_args) atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads, (nqb + 127u) / 128u, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder setComputePipelineState:select_pipeline];
+        [encoder setBuffer:TENSOR(scores).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(thresholds).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(sel_offsets).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(sel_indices).buffer offset:0 atIndex:3];
+        [encoder setBytes:&scores_args length:sizeof(scores_args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(scan_threads, 1, 1)];
+        [encoder setComputePipelineState:attn_pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&attn_args length:sizeof(attn_args) atIndex:4];
+        [encoder setBuffer:TENSOR(pooled).buffer offset:0 atIndex:5];
+        [encoder setBuffer:TENSOR(scores).buffer offset:0 atIndex:6];
+        [encoder setBuffer:TENSOR(sel_offsets).buffer offset:0 atIndex:7];
+        [encoder setBuffer:TENSOR(sel_indices).buffer offset:0 atIndex:8];
+        [encoder dispatchThreadgroups:MTLSizeMake(nqb, heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += 4;
+    gpu.stats = stats;
+    return 1;
 }

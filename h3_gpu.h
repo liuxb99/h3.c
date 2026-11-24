@@ -530,6 +530,17 @@ int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                           const h3_gpu_tensor *rope_sin_f32,
                           uint32_t sequence, uint32_t query_heads,
                           uint32_t kv_heads, uint32_t head_dim);
+/* Sol-Attn block-sparse attention over bf16 row-major [rows, heads, 128]
+ * tensors; scratch tensors are caller-allocated and reused per call. */
+int h3_gpu_sol_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                         const h3_gpu_tensor *value, uint32_t sequence,
+                         uint32_t heads, uint32_t head_dim, float scale,
+                         uint32_t block, uint32_t video_start,
+                         uint32_t video_stop, float tau,
+                         h3_gpu_tensor *pooled, h3_gpu_tensor *scores,
+                         h3_gpu_tensor *thresholds, h3_gpu_tensor *sel_offsets,
+                         h3_gpu_tensor *sel_indices);
 int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *query,
                            const h3_gpu_tensor *key,

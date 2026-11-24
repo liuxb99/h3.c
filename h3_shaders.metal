@@ -4330,3 +4330,218 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+/* ---- Sol-Attn block-sparse attention (reference: "Sol-Attention",
+ * arXiv 2607.24027). Prefix rows and all prefix KV blocks keep exact
+ * attention; target video rows attend selected KV blocks exactly and
+ * every dropped block contributes its pooled-value estimate weighted by
+ * its pooled block score on the same online softmax denominator. ---- */
+struct sol_pool_args { uint sequence, heads, block, video_start, video_stop; };
+kernel void h3_sol_block_pool_bf16(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *pooled [[buffer(3)]],
+        constant sol_pool_args &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    uint i = group.x, h = group.y, which = group.z;
+    uint nqb = (args.sequence + args.block - 1u) / args.block;
+    if (i >= nqb || h >= args.heads) return;
+    device const ushort *src = which == 0u ? query : (which == 1u ? key : value);
+    uint row0 = i * args.block, row1 = min(row0 + args.block, args.sequence);
+    uint lo = max(row0, args.video_start), hi = min(row1, args.video_stop);
+    uint count = hi > lo ? hi - lo : 0u;
+    size_t out = ((size_t)which * args.heads + h) * nqb * 128u + (size_t)i * 128u;
+    if (count == 0u) { if (tid < 128u) pooled[out + tid] = 0u; return; }
+    float sum = 0.0f;
+    for (uint row = lo + tid; row < hi; row += 128u)
+        sum += h3_bf16_to_f32(src[((size_t)row * args.heads + h) * 128u + tid]);
+    pooled[out + tid] = h3_f32_to_bf16(sum / (float)count);
+}
+
+struct sol_scores_args { uint nqb, heads, video_first, video_last, video_start, video_stop; float scale, tau; };
+kernel void h3_sol_block_scores_bf16(
+        device const ushort *pooled [[buffer(0)]],
+        device float *scores [[buffer(1)]],
+        device float *thresholds [[buffer(2)]],
+        constant sol_scores_args &args [[buffer(3)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    uint h = group.x, i = group.y * 128u + tid;
+    if (i >= args.nqb) return;
+    size_t cq = ((size_t)h * args.nqb + i) * 128u;
+    uint block0 = i * 128u, block1 = block0 + 128u;
+    bool intersects = block0 < args.video_stop && block1 > args.video_start &&
+                      args.video_last > args.video_first;
+    bool fully = block0 >= args.video_start && block1 <= args.video_stop;
+    size_t row = ((size_t)h * args.nqb + i) * args.nqb;
+    if (!intersects || args.video_last <= args.video_first) {
+        thresholds[(size_t)h * args.nqb + i] = 1.0e30f; return;
+    }
+    float mean = 0.0f, var = 0.0f;
+    uint count = args.video_last - args.video_first;
+    for (uint pass = 0u; pass < 2u; pass++) {
+        float sum = 0.0f, sum2 = 0.0f;
+        for (uint j = args.video_first; j < args.video_last; j++) {
+            size_t ck = ((size_t)h * args.nqb + j) * 128u;
+            float dot = 0.0f;
+            for (uint d = 0u; d < 128u; d++)
+                dot = fma(h3_bf16_to_f32(pooled[cq + d]),
+                          h3_bf16_to_f32(pooled[ck + d]), dot);
+            dot *= args.scale;
+            if (pass == 1u) scores[row + j] = dot;
+            sum += dot; sum2 += dot * dot;
+        }
+        mean = sum / (float)count;
+        var = max(sum2 / (float)count - mean * mean, 0.0f);
+        if (pass == 0u) { /* second pass stores scores; mean/var carried */
+            float m2 = mean; mean = mean; m2 = m2;
+        }
+    }
+    thresholds[(size_t)h * args.nqb + i] = fully ? mean + args.tau * sqrt(var)
+                                                  : 1.0e30f;
+}
+
+kernel void h3_sol_block_select_bf16(
+        device const float *scores [[buffer(0)]],
+        device const float *thresholds [[buffer(1)]],
+        device uint *sel_offsets [[buffer(2)]],
+        device uint *sel_indices [[buffer(3)]],
+        constant sol_scores_args &args [[buffer(4)]],
+        uint h [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint threads [[threads_per_threadgroup]]) {
+    /* One threadgroup per head; grid.x == heads. Row counts are computed
+     * in parallel, then thread 0 performs the (short) serial prefix sum;
+     * index lists are written by row threads in ascending block order. */
+    uint nqb = args.nqb;
+    uint count = 0u;
+    float threshold = 1.0e30f;
+    size_t row = 0u;
+    if (h < args.heads) {
+        for (uint i = tid; i < nqb; i += threads) {
+            threshold = thresholds[(size_t)h * nqb + i];
+            row = ((size_t)h * nqb + i) * nqb;
+            uint c = 0u;
+            for (uint j = args.video_first; j < args.video_last; j++)
+                if (scores[row + j] > threshold) c++;
+            sel_offsets[(size_t)h * (nqb + 1u) + i + 1u] = c;  /* counts first */
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (h >= args.heads) return;
+    if (tid == 0u) {
+        uint running = 0u;
+        for (uint i = 0u; i < nqb; i++) {
+            uint c = sel_offsets[(size_t)h * (nqb + 1u) + i + 1u];
+            sel_offsets[(size_t)h * (nqb + 1u) + i] = running;
+            running += c;
+        }
+        sel_offsets[(size_t)h * (nqb + 1u) + nqb] = running;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < nqb; i += threads) {
+        threshold = thresholds[(size_t)h * nqb + i];
+        row = ((size_t)h * nqb + i) * nqb;
+        uint slot = sel_offsets[(size_t)h * (nqb + 1u) + i];
+        for (uint j = args.video_first; j < args.video_last; j++)
+            if (scores[row + j] > threshold) {
+                sel_indices[((size_t)h * nqb + i) * nqb + slot] = j;
+                slot++;
+            }
+    }
+}
+
+struct sol_attn_args { uint sequence, heads, block, nqb, video_start, video_stop, video_first, video_last; float scale; };
+kernel void h3_sol_attn_bf16(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        constant sol_attn_args &args [[buffer(4)]],
+        device const ushort *pooled [[buffer(5)]],
+        device const float *scores [[buffer(6)]],
+        device const uint *sel_offsets [[buffer(7)]],
+        device const uint *sel_indices [[buffer(8)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    uint i = group.x, h = group.y;
+    uint row = i * args.block + tid;
+    if (row >= args.sequence) return;
+    uint nqb = args.nqb;
+    bool target = row >= args.video_start && row < args.video_stop;
+    size_t qbase = ((size_t)row * args.heads + h) * 128u;
+    device const ushort *qrow = query + qbase;
+    private float acc[128];
+    private float keyscores[64];
+    float m = -INFINITY, l = 0.0f;
+    for (uint d = 0u; d < 128u; d++) acc[d] = 0.0f;
+
+    for (uint j = 0u; j < nqb; j++) {
+        bool video_block = j >= args.video_first && j < args.video_last;
+        bool exact;
+        if (!target) exact = true;            /* prefix rows: full exact */
+        else if (!video_block) exact = true;  /* prefix KV sink */
+        else {
+            /* selected via binary search over this row block's list */
+            uint base = sel_offsets[(size_t)h * (nqb + 1u) + i];
+            uint end = sel_offsets[(size_t)h * (nqb + 1u) + i + 1u];
+            exact = false;
+            uint lo = base, hi = end;
+            while (lo < hi) {
+                uint mid = (lo + hi) / 2u;
+                uint v = sel_indices[((size_t)h * nqb + i) * nqb + mid];
+                if (v == j) { exact = true; break; }
+                if (v < j) lo = mid + 1u; else hi = mid;
+            }
+        }
+        if (!exact) {
+            /* pooled compensation with the block score */
+            float s = scores[((size_t)h * nqb + i) * nqb + j];
+            float newm = fmax(m, s), em = exp(m - newm);
+            float p = exp(s - newm);
+            l = fma(l, em, p); m = newm;
+            size_t cv = ((size_t)2u * args.heads + h) * nqb * 128u +
+                        (size_t)j * 128u;
+            for (uint d = 0u; d < 128u; d++)
+                acc[d] = fma(p, h3_bf16_to_f32(pooled[cv + d]), acc[d] * em);
+            continue;
+        }
+        uint k0 = j * args.block, k1 = min(k0 + args.block, args.sequence);
+        for (uint kc = k0; kc < k1; kc += 64u) {
+            uint kn = min(64u, k1 - kc);
+            float newm = m;
+            for (uint t = 0u; t < kn; t++) {
+                device const ushort *krow = key +
+                    ((size_t)(kc + t) * args.heads + h) * 128u;
+                float dot = 0.0f;
+                for (uint d = 0u; d < 128u; d++)
+                    dot = fma(h3_bf16_to_f32(qrow[d]),
+                              h3_bf16_to_f32(krow[d]), dot);
+                dot *= args.scale;
+                keyscores[t] = dot;
+                newm = fmax(newm, dot);
+            }
+            float em = exp(m - newm);
+            float lsum = 0.0f;
+            for (uint t = 0u; t < kn; t++) {
+                float p = exp(keyscores[t] - newm);
+                keyscores[t] = p;
+                lsum += p;
+            }
+            l = fma(l, em, lsum); m = newm;
+            for (uint d = 0u; d < 128u; d++) {
+                float o = acc[d] * em;
+                for (uint t = 0u; t < kn; t++)
+                    o = fma(keyscores[t], h3_bf16_to_f32(
+                        value[((size_t)(kc + t) * args.heads + h) * 128u + d]),
+                        o);
+                acc[d] = o;
+            }
+        }
+    }
+    float inv = 1.0f / l;
+    for (uint d = 0u; d < 128u; d++)
+        output[qbase + d] = h3_f32_to_bf16(acc[d] * inv);
+}
