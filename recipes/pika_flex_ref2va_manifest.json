@@ -1,0 +1,41 @@
+{
+  "format_version": 1,
+  "model": "pika-flex",
+  "task": "ref2va",
+  "release_id": "pika-flex-ref2va-v1",
+  "rank": 128,
+  "alpha": 128,
+  "trunk": "transformer_ref",
+  "numerics_policy": "fp32_conditioning_v1",
+  "sampling": {
+    "knots": [
+      1000,
+      750,
+      500,
+      250,
+      100,
+      40,
+      0
+    ],
+    "video_shift": 12.0,
+    "audio_shift": 3.0,
+    "method": "renoise"
+  },
+  "base": {
+    "repo_id": "MiniMaxAI/MiniMax-H3",
+    "revision": "42ed227ee7df40d41602854ae760620d6eb651fe"
+  },
+  "target_modules": [
+    "to_q",
+    "to_k",
+    "to_v",
+    "to_out.0",
+    "ff.net.0.proj",
+    "ff.net.2"
+  ],
+  "sha256": "eef684ba1258f0cdbbbda6128188ad2688417f2eb17ff875375e74a32b6d61b5",
+  "modified_by": "Mellis, Inc.",
+  "modification_notice": "Modified by Mellis, Inc. in 2026. Copyright © 2026 Mellis, Inc.\nModel Derivative of MiniMax H3, distributed under the MiniMax H3 Community License Agreement.",
+  "license": "MiniMax H3 Community License Agreement",
+  "copyright": "Copyright © 2026 Mellis, Inc."
+}
