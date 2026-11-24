@@ -44,6 +44,14 @@ MPS 基準測試。
 #92 renoise 排程、#93/#73/#80/#78/#81 VAE 加速、#95 LoRA 折疊工具、
 #96 條件快取鍵、#97 sol-attn 後續、#98 競爭修正、#100 fp16 路徑。
 
+## v2.1 調研補充（2026-11-25 M0 前後）
+- **模型盤佈局（實測）**：原版 FL2VA 全套 134G 已在 `/Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3/FL2VA/`（transformer 13 shards+TE+video_vae+audio_vae+tokenizer）；Ref2VA 62G 於 `/Volumes/SSD2T/models/MiniMax-H3-ref2va/`，以 `Ref2VA` 符號連結掛入 h3.c model dir。`./h3 --info` 全過（535 tensors×13 ✓）。
+- **`--render-width/height` 現狀**：僅把 conditioning+latent canvas 縮到 render 尺寸，輸出=render 尺寸，**無任何 latent/pixel 上採**——達不到 PR#97 語義，M3 latent 上採器移植必須自建。
+- **h3.c 無 sol-attn/tau 任何實作**（grep 零命中）；P2 連 CLI 標幟（`--sol-attn --tau`）一併新增。
+- **LatentResizer3D 架構（ground truth 歸檔 `docs/upstream_refs/selflift/h3_upscaler.py`）**：24ch in→channels(由 conv_in 頭探測) 3d-conv；in_blocks 低解析段 → 中段 trilinear(align_corners=False) → out_blocks 高解析段 → conv_out；scale-emb=Linear(1→64)→SiLU→Linear，注入每個 ResBlockEmb3D（emb→2C 拆 scale/shift，`out_norm(h)*(1+scale)+shift`）；TemporalConv=GroupNorm→SiLU→dwconv(T,k,groups=C,pad=k//2)→pwconv(零初始化)→殘差；GroupNorm 固定 32 組；時間 chunk=32/overlap=5 線性 blend（首版可關 chunking，latent_t≤5 時本就單段）。
+- **記憶體共存策略**：TE bf16 62G 常駐 + int8 DiT 31G + VAE 10G ≈ 104G > (107.5G GPU 集上限 − Strata 佔用) ⇒ **M0/M1 走 `--ssd-streaming`**（DiT 權重 SSD 直讀不入 GPU 集，720MB/s）；resident int8 產量模式需在 Strata 空閒窗口或 TE 釋放方案後驗證——不動 Strata（用戶政策）。
+- **折疊工具驗證**：合成單測 PASS（delta=scale·B@A、scale=strength、rank==alpha 慣例；殘差 max 0.0156=bf16 舍入）。
+
 ## 3. 本機資產盤點（2026-11-25 實測）
 
 | 資產 | 路徑 | 大小 | 狀態 |
