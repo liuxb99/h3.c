@@ -87,17 +87,32 @@ Ref2VA/transformer(下載中)＋text_encoder/tokenizer/vae/audio_vae/processor
 - **M0 端到端基線**：Ref2VA 原版＋h3.c 原生 int8，預設線性排程 20 步→小解析度
   （640×352、22 幀）產出真實 MP4＋ffprobe＋接觸表。目的：驗證引擎、TE、VAE、
   Ref2VA 段落、封裝全鏈路。
-- **M1 Flex 排程＋Renoise**：新增 knots 排程模式（shift 套用於 knots 歸一 sigma）
-  ＋步間 renoise（先以 diffusers MiniMaxH3Scheduler 語義移植，再用 ComfyX 節點源碼
-  校核）。6 步跑通＝配方步數契約成立。
+- **M1（降級為選用實驗）**：實讀 Comfy 源碼判定：O87 MPS 配方
+  BasicScheduler(simple)＋ModelSampling(shift 12)＋KSampler(euler) ≡
+  均勻 sigma 格點＋shift 變形＋確定性 euler ＝ h3.c 預設排程，語義已等價 ✅。
+  官方 Flex knots[1000,750,500,250,100,40,0]＋renoise（k_diffusion
+  `sample_dpmpp_2s_ancestral_RF`，renoise_coeff=√(σ_{i+1}²−σ_down²α_{i+1}²/α_down²)）
+  僅為官方運行變體，列為可選 A/B，不是阻塞項。
 - **M2 LoRA 折疊**：移植 PR#95 折疊工具，擴充 ComfyUI 命名
   （`lora_diffusion_model_blocks.N…`、fusion QKV rank384、SwiGLU 重排）→
   折入原版 Ref2VA 產出 flex 權重（bf16 常駐版＋h3.c 載入時 int8 量化）。
   驗收：折疊前後對 3 個 block 抽樣 GEMM 數值對比 PASS。
-- **M3 SelfLift 兩段式**：新增 `h3_selflift.c`：低解析度（0.4×）去噪→latent
-  3d-conv upscaler（權重＝本機 fp16 v1）→高解析度尾段 ts=3（wmin0.5/wmax1、
-  rho0.4 語義按 ComfyX SelfLiftH3Sampler 源碼逐行校核）。先 640×352→1280×704，
-  後 1344×768。
+- **M3 SelfLift 兩段式**（ground-truth：facok/comfyui-SelfLift@master 已存
+  `docs/upstream_refs/selflift/`，語義逐行摘錄如下）：
+  1. 低解析度latent（round(H·scale 取偶、≥2；trilinear 下採樣初始 latent；
+     音訊流不動）以 `sigmas[:ts+1]` euler 去噪到 σ_{ts−1}，記錄末次評測的
+     x0 預言（Eq.3 端點，其 euler 更新丟棄）。
+  2. 轉換：z0_low(VAE latent 域)→雙_lift：z_lat＝外部 3d-conv upscaler 昇解析
+     （latent 域 route，rho=0 預設，免 VAE 來回）；z_pix＝VAE 解碼→像素昇解析→
+     VAE 重編碼（route 像素，rho>0 混合需要）；`artifact_aware_consistency_lift
+     (z_lat,z_pix,rho,w_min,w_max)`      依風險圖混合。h3.c 移植順序：先 latent-route
+      （rho=0，免 VAE 來回），像素 route 列後續實驗。注意：O87 生產節點參數為
+      rho=0.4（混合路線，含 VAE 來回），故 rho=0 首版屬**記錄在案的偏差**，
+      畫質驗收須與 O87 成片對比後決定是否補像素 route。
+  3. 再噪：x=noise_scaling(σ_{ts−1}, N_{seed+1}, z0_high)→單步 euler 到 σ_ts
+     →inverse_noise_scaling→高解析度以 `sigmas[ts:]` 續跑（NFE 守恆：總評測
+     步數＝原排程）。
+  4. 驗收：先 640×352→(scale=0.5)1280×704 小尺寸，後 1344×768 目標尺寸。
 - **M4 sol-attn**：基線先用 h3.c 原生稠密 attention 測 1344×768；若 attention
   占比>35% 再移植 BlockSparse（PR#86/#97 語義＋τ1.3/γ0.2/12288/256/exact_kv）。
   以實測決定是否納入，不合適即記錄 FAIL 理由。
