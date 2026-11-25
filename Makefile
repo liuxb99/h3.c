@@ -84,6 +84,9 @@ h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
 h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+harness_forward: tests/bench_dit.o $(LIB_OBJ)
+	./tests/bench_dit --forward --model-dir /Volumes/SSD2T/models/MiniMax-H3-comfy-int8/FL2VA/transformer --shaders /Users/cyliu99/AI/h3c_mac_20261125/h3c/metal/h3_shaders.metal --width 128 --height 128 --frames 1 --steps 1 --seed 1 $(HARNESS_ARGS)
+
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

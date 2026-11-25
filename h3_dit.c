@@ -1,7 +1,18 @@
 #include "h3_dit.h"
 
+#include "h3_internal.h"
+
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
+
+static const char *h3_dump_dir(void);
+static void dit_dump_raw(h3_dit *dit, const void *values, size_t bytes,
+                         const char *tag, uint32_t rows, uint32_t cols,
+                         const char *dtype);
+static void dit_dump_gpu(h3_dit *dit, const h3_gpu_tensor *tensor,
+                         const char *tag, uint32_t rows, uint32_t cols);
+static int dit_dump_pause(h3_dit *dit);
+static int dit_dump_resume(h3_dit *dit);
 
 #include <math.h>
 #include <pthread.h>
@@ -111,6 +122,8 @@ struct h3_dit {
     unsigned core_reuse_interval;
     unsigned core_forward_count;
     int core_residual_ready;
+    int dump_active;
+    int dump_done;
     unsigned active_block_count;
     uint8_t block_active[H3_DIT_BLOCKS];
     h3_layout layout;
@@ -1131,6 +1144,20 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
             }
         }
     }
+    if (h3_dump_dir() && !dit->dump_done) {
+        dit->dump_active = 1;
+        dit_dump_raw(dit, cosines, count * sizeof(*cosines),
+                     "b0_rope_cos_table", (uint32_t)dit->sequence, ROPE_HALF,
+                     "f32");
+        dit_dump_raw(dit, sines, count * sizeof(*sines),
+                     "b0_rope_sin_table", (uint32_t)dit->sequence, ROPE_HALF,
+                     "f32");
+        dit_dump_raw(dit, dit->layout.positions,
+                     (size_t)dit->sequence * sizeof(*dit->layout.positions),
+                     "b0_layout_positions", (uint32_t)dit->sequence, 3,
+                     "f64");
+        dit->dump_active = 0;
+    }
     h3_gpu_tensor *cos_f32 = h3_gpu_tensor_from_f32(dit->gpu, cosines, count);
     h3_gpu_tensor *sin_f32 = h3_gpu_tensor_from_f32(dit->gpu, sines, count);
     h3_gpu_tensor *reduced_cos_f32 = reduced_count ?
@@ -2089,6 +2116,75 @@ static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
     return 1;
 }
 
+/* Env-gated intermediate dumps for forward-level numerics bisection.
+ * Everything below is dead unless H3_DUMP_DIR is set: the tap helper checks
+ * dit->dump_active first and returns with no GPU work when unset. Dumps only
+ * fire on step 0, block 0, and only once (dit->dump_done latch). */
+static const char *h3_dump_dir(void) {
+    static const char *cached;
+    static int probed;
+    if (!probed) {
+        probed = 1;
+        const char *value = getenv("H3_DUMP_DIR");
+        if (value && *value) cached = value;
+    }
+    return cached;
+}
+
+static void dit_dump_raw(h3_dit *dit, const void *values, size_t bytes,
+                         const char *tag, uint32_t rows, uint32_t cols,
+                         const char *dtype) {
+    if (!dit->dump_active || !values || !bytes) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s_%ux%u_%s.raw", h3_dump_dir(), tag,
+             rows, cols, dtype);
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        fprintf(stderr, "h3 dump: cannot write %s\n", path);
+        return;
+    }
+    fwrite(values, 1, bytes, file);
+    if (fclose(file) != 0)
+        fprintf(stderr, "h3 dump: write error on %s\n", path);
+    char manifest[1024];
+    snprintf(manifest, sizeof(manifest), "%s/manifest.tsv", h3_dump_dir());
+    FILE *list = fopen(manifest, "a");
+    if (list) {
+        fprintf(list, "%s\t%u\t%u\t%s\t%zu\n", tag, rows, cols, dtype, bytes);
+        fclose(list);
+    }
+}
+
+/* GPU tensors are shared-storage, so byte contents read exactly what the
+ * GPU last wrote, provided the command chain is drained. Pause submits and
+ * waits; resume reopens the chain the caller had begun. */
+static int dit_dump_pause(h3_dit *dit) {
+    if (!h3_gpu_submit(dit->gpu)) return 0;
+    return 1;
+}
+
+static int dit_dump_resume(h3_dit *dit) {
+    if (!h3_gpu_begin(dit->gpu)) return 0;
+    return 1;
+}
+
+static void dit_dump_gpu(h3_dit *dit, const h3_gpu_tensor *tensor,
+                         const char *tag, uint32_t rows, uint32_t cols) {
+    if (!dit->dump_active || !tensor) return;
+    static const char *names[] = {"f32", "bf16", "i8", "u32"};
+    h3_gpu_dtype dtype = h3_gpu_tensor_dtype((h3_gpu_tensor *)tensor);
+    if (dtype > H3_GPU_U32) return;
+    size_t length = 0;
+    const unsigned char *bytes =
+        h3_gpu_tensor_bytes((h3_gpu_tensor *)tensor, &length);
+    if (!bytes || !length) return;
+    size_t elem_bytes = dtype == H3_GPU_I8 ? 1u : (dtype == H3_GPU_BF16 ? 2u : 4u);
+    if (rows && cols && rows * cols * elem_bytes != length)
+        fprintf(stderr, "h3 dump: shape mismatch for %s (%zu bytes)\n",
+                tag, length);
+    dit_dump_raw(dit, bytes, length, tag, rows, cols, names[dtype]);
+}
+
 static int run_block(h3_dit *dit, unsigned index, int step,
                      h3_dit_block *weight,
                      int attention_adaln_ready,
@@ -2110,10 +2206,39 @@ static int run_block(h3_dit *dit, unsigned index, int step,
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
+    if (dit->dump_active && index == 0 && step == 0) {
+        if (dit_dump_pause(dit)) {
+            dit_dump_gpu(dit, dit->hidden, "b0_hidden_in", rows, HIDDEN);
+            dit_dump_gpu(dit, modulation, "b0_adaln_mod_table", 0,
+                         SLOTS * HIDDEN);
+            dit_dump_gpu(dit, row_map, "b0_row_map", rows, 1);
+            dit_dump_gpu(dit, rope_cos, "b0_rope_cos_bf16", rows, ROPE_HALF);
+            dit_dump_gpu(dit, rope_sin, "b0_rope_sin_bf16", rows, ROPE_HALF);
+            dit_dump_gpu(dit, weight->norm1, "b0_norm1_w", 1, HIDDEN);
+            dit_dump_gpu(dit, weight->qkv, "b0_qkv_w", 0, HIDDEN);
+            dit_dump_gpu(dit, weight->q_norm, "b0_q_norm_w", 1, HEAD_DIM);
+            dit_dump_gpu(dit, weight->k_norm, "b0_k_norm_w", 1, HEAD_DIM);
+            dit_dump_gpu(dit, weight->out, "b0_out_w", 0, INNER);
+            dit_dump_gpu(dit, weight->norm2, "b0_norm2_w", 1, HIDDEN);
+            dit_dump_gpu(dit, weight->fc1, "b0_fc1_w", 0, HIDDEN);
+            dit_dump_gpu(dit, weight->fc2, "b0_fc2_w", 0, FFN);
+            if (!dit_dump_resume(dit))
+                fprintf(stderr, "h3 dump: resume failed at b0 input\n");
+        } else
+            fprintf(stderr, "h3 dump: pause failed at b0 input\n");
+    }
     if (!attention_adaln_ready)
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
+    if (dit->dump_active && index == 0 && step == 0) {
+        if (dit_dump_pause(dit)) {
+            dit_dump_gpu(dit, dit->mod_attention, "b0_attn_adaln_out",
+                         rows, HIDDEN);
+            if (!dit_dump_resume(dit))
+                fprintf(stderr, "h3 dump: resume failed at attn adaln\n");
+        }
+    }
     if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
@@ -2132,6 +2257,17 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->mod_attention, weight->qkv, weight->q_norm, weight->k_norm,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
+    }
+    if (dit->dump_active && index == 0 && step == 0) {
+        if (dit_dump_pause(dit)) {
+            dit_dump_gpu(dit, dit->qkv, "b0_qkv_pre_norm", rows, 3u * INNER);
+            dit_dump_gpu(dit, dit->query, "b0_q_post_qknorm_rope",
+                         rows, INNER);
+            dit_dump_gpu(dit, dit->key, "b0_k_post_qknorm_rope", rows, INNER);
+            dit_dump_gpu(dit, dit->value, "b0_v_after_qkv", rows, INNER);
+            if (!dit_dump_resume(dit))
+                fprintf(stderr, "h3 dump: resume failed at qkv taps\n");
+        }
     }
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
@@ -2164,6 +2300,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
+    if (dit->dump_active && index == 0 && step == 0) {
+        if (dit_dump_pause(dit)) {
+            dit_dump_gpu(dit, dit->attention_heads, "b0_attention_out",
+                         rows, INNER);
+            if (!dit_dump_resume(dit))
+                fprintf(stderr, "h3 dump: resume failed at attn out\n");
+        }
+    }
     {
         static const char *dump_dir = NULL;
         static int dump_done = 0;
@@ -2171,29 +2315,32 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             if (!dump_dir) dump_dir = getenv("H3_DUMP_DIR");
             if (dump_dir && *dump_dir && index == 2u) {
                 dump_done = 1;
-                h3_gpu_submit(dit->gpu);
-                static const char *names[9] = {"q", "k", "v", "heads",
-                    "pooled", "scores", "thresholds", "sel_offsets",
-                    "sel_indices"};
-                h3_gpu_tensor *tensors[9] = {dit->query, dit->key,
-                    dit->value, dit->attention_heads, dit->sol_pooled,
-                    dit->sol_scores, dit->sol_thresholds,
-                    dit->sol_sel_offsets, dit->sol_sel_indices};
-                for (int d = 0; d < 9; d++) {
-                    size_t len = 0;
-                    const unsigned char *bytes =
-                        h3_gpu_tensor_bytes(tensors[d], &len);
-                    if (!bytes || !len) continue;
-                    char path[512];
-                    snprintf(path, sizeof(path), "%s/%s.bin", dump_dir,
-                             names[d]);
-                    FILE *f = fopen(path, "wb");
-                    if (f) {
-                        fwrite(bytes, 1, len, f);
-                        fclose(f);
+                if (!h3_gpu_submit(dit->gpu) || !h3_gpu_begin(dit->gpu)) {
+                    fprintf(stderr, "h3 dump: sol dump submit/begin failed\n");
+                } else {
+                    static const char *names[9] = {"q", "k", "v", "heads",
+                        "pooled", "scores", "thresholds", "sel_offsets",
+                        "sel_indices"};
+                    h3_gpu_tensor *tensors[9] = {dit->query, dit->key,
+                        dit->value, dit->attention_heads, dit->sol_pooled,
+                        dit->sol_scores, dit->sol_thresholds,
+                        dit->sol_sel_offsets, dit->sol_sel_indices};
+                    for (int d = 0; d < 9; d++) {
+                        size_t len = 0;
+                        const unsigned char *bytes =
+                            h3_gpu_tensor_bytes(tensors[d], &len);
+                        if (!bytes || !len) continue;
+                        char path[512];
+                        snprintf(path, sizeof(path), "%s/%s.bin", dump_dir,
+                                 names[d]);
+                        FILE *f = fopen(path, "wb");
+                        if (f) {
+                            fwrite(bytes, 1, len, f);
+                            fclose(f);
+                        }
                     }
+                    fprintf(stderr, "h3: sol dump complete rows=%u\n", rows);
                 }
-                fprintf(stderr, "h3: sol dump complete rows=%u\n", rows);
             }
         }
     }
@@ -2215,6 +2362,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
+    }
+    if (dit->dump_active && index == 0 && step == 0) {
+        if (dit_dump_pause(dit)) {
+            dit_dump_gpu(dit, dit->attention_output, "b0_out_proj_out",
+                         dit->ssd_streaming ? rows + 1u : rows, HIDDEN);
+            if (!dit_dump_resume(dit))
+                fprintf(stderr, "h3 dump: resume failed at out proj\n");
+        }
     }
     int fused_int8_mlp_input = dit->int8_mlp &&
         !dit->use_slower_unfused_int8_inputs &&
@@ -2243,6 +2398,15 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->mod_mlp, dit->hidden, weight->norm2,
             modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
            "DiT MLP AdaLN");
+    }
+    if (dit->dump_active && index == 0 && step == 0) {
+        if (dit_dump_pause(dit)) {
+            dit_dump_gpu(dit, dit->hidden, "b0_post_attn_hidden", rows,
+                         HIDDEN);
+            dit_dump_gpu(dit, dit->mod_mlp, "b0_mlp_adaln_in", rows, HIDDEN);
+            if (!dit_dump_resume(dit))
+                fprintf(stderr, "h3 dump: resume failed at post-attn\n");
+        }
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
@@ -2276,6 +2440,15 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
     }
+    if (dit->dump_active && index == 0 && step == 0) {
+        if (dit_dump_pause(dit)) {
+            dit_dump_gpu(dit, dit->fc1, "b0_fc1_out", rows, FFN * 2);
+            dit_dump_gpu(dit, dit->activated, "b0_swiglu_out", rows, FFN);
+            dit_dump_gpu(dit, mlp_output, "b0_fc2_out", rows, HIDDEN);
+            if (!dit_dump_resume(dit))
+                fprintf(stderr, "h3 dump: resume failed at mlp taps\n");
+        }
+    }
     if (fuse_next_attention) {
         h3_dit_block *next_weight = &dit->blocks[next_index];
         const h3_gpu_tensor *next_modulation = h3_dit_schedule_block(
@@ -2306,6 +2479,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_gate_bf16(
             dit->gpu, dit->hidden, dit->hidden, mlp_output,
             modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
+    }
+    if (dit->dump_active && index == 0 && step == 0) {
+        dit->dump_done = 1;
+        if (dit_dump_pause(dit)) {
+            dit_dump_gpu(dit, dit->hidden, "b0_block_out", rows, HIDDEN);
+            if (!dit_dump_resume(dit))
+                fprintf(stderr, "h3 dump: resume failed at block out\n");
+        }
     }
 #undef OP
     return 1;
@@ -2929,6 +3110,14 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
         h3_gpu_tensor_write_f32_range(dit->audio_input, audio_offset,
                                       audio_rows, audio_count);
     if (!ok) fail(error, error_size, "cannot pack/write GPU Euler latents");
+    if (ok && h3_dump_dir() && !dit->dump_done) {
+        dit->dump_active = 1;
+        dit_dump_raw(dit, video_rows,
+                     (size_t)dit->video_rows * VIDEO_PATCH *
+                         sizeof(*video_rows),
+                     "step0_denoise_input_latents",
+                     (uint32_t)dit->video_rows, VIDEO_PATCH, "f32");
+    }
 
     int last_evaluated = -1;
     int previous_evaluated = -1;
@@ -3026,6 +3215,13 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
     if (ok && command_active)
         ok = gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
                     "submit GPU Euler denoise");
+    if (ok && dit->dump_active) {
+        uint32_t velocity_rows = dit->token_reduction
+            ? dit->reduced_sequence : (uint32_t)dit->video_rows;
+        dit_dump_gpu(dit, dit->video_output_bf16, "step0_velocity_bf16",
+                     velocity_rows, VIDEO_PATCH);
+        dit->dump_active = 0;
+    }
     if (ok) ok = h3_gpu_tensor_read_f32_range(
                      dit->video_input, video_offset, video_rows, video_count) &&
                  h3_gpu_tensor_read_f32_range(
