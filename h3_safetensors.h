@@ -20,7 +20,8 @@ typedef enum {
     H3_DTYPE_F32,
     H3_DTYPE_I64,
     H3_DTYPE_U64,
-    H3_DTYPE_F64
+    H3_DTYPE_F64,
+    H3_DTYPE_F8_E4M3
 } h3_dtype;
 
 typedef struct {
@@ -39,6 +40,8 @@ typedef struct {
     uint64_t header_size;
     h3_st_tensor *tensors;
     size_t tensor_count;
+    /* Raw JSON text of the optional __metadata__ entry, if present. */
+    char *metadata_json;
 } h3_st_header;
 
 int h3_st_read_header(const char *path, h3_st_header *header,
