@@ -124,6 +124,9 @@ struct h3_dit {
     int core_residual_ready;
     int dump_active;
     int dump_done;
+    int dump_all;
+    int dump_step;
+    unsigned dump_block;
     unsigned active_block_count;
     uint8_t block_active[H3_DIT_BLOCKS];
     h3_layout layout;
@@ -2135,8 +2138,15 @@ static void dit_dump_raw(h3_dit *dit, const void *values, size_t bytes,
                          const char *tag, uint32_t rows, uint32_t cols,
                          const char *dtype) {
     if (!dit->dump_active || !values || !bytes) return;
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/%s_%ux%u_%s.raw", h3_dump_dir(), tag,
+    const char *name = tag;
+    char prefixed[256];
+    if (dit->dump_all && dit->dump_step >= 0 && strncmp(tag, "b0_", 3) == 0) {
+        snprintf(prefixed, sizeof(prefixed), "b%u_s%d_%s", dit->dump_block,
+                 dit->dump_step, tag + 3);
+        name = prefixed;
+    }
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/%s_%ux%u_%s.raw", h3_dump_dir(), name,
              rows, cols, dtype);
     FILE *file = fopen(path, "wb");
     if (!file) {
@@ -2150,7 +2160,7 @@ static void dit_dump_raw(h3_dit *dit, const void *values, size_t bytes,
     snprintf(manifest, sizeof(manifest), "%s/manifest.tsv", h3_dump_dir());
     FILE *list = fopen(manifest, "a");
     if (list) {
-        fprintf(list, "%s\t%u\t%u\t%s\t%zu\n", tag, rows, cols, dtype, bytes);
+        fprintf(list, "%s\t%u\t%u\t%s\t%zu\n", name, rows, cols, dtype, bytes);
         fclose(list);
     }
 }
@@ -2206,22 +2216,30 @@ static int run_block(h3_dit *dit, unsigned index, int step,
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
-    if (dit->dump_active && index == 0 && step == 0) {
+    dit->dump_block = index;
+    dit->dump_step = step;
+    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->hidden, "b0_hidden_in", rows, HIDDEN);
-            dit_dump_gpu(dit, modulation, "b0_adaln_mod_table", 0,
-                         SLOTS * HIDDEN);
             dit_dump_gpu(dit, row_map, "b0_row_map", rows, 1);
-            dit_dump_gpu(dit, rope_cos, "b0_rope_cos_bf16", rows, ROPE_HALF);
-            dit_dump_gpu(dit, rope_sin, "b0_rope_sin_bf16", rows, ROPE_HALF);
-            dit_dump_gpu(dit, weight->norm1, "b0_norm1_w", 1, HIDDEN);
-            dit_dump_gpu(dit, weight->qkv, "b0_qkv_w", 0, HIDDEN);
-            dit_dump_gpu(dit, weight->q_norm, "b0_q_norm_w", 1, HEAD_DIM);
-            dit_dump_gpu(dit, weight->k_norm, "b0_k_norm_w", 1, HEAD_DIM);
-            dit_dump_gpu(dit, weight->out, "b0_out_w", 0, INNER);
-            dit_dump_gpu(dit, weight->norm2, "b0_norm2_w", 1, HIDDEN);
-            dit_dump_gpu(dit, weight->fc1, "b0_fc1_w", 0, HIDDEN);
-            dit_dump_gpu(dit, weight->fc2, "b0_fc2_w", 0, FFN);
+            if (dit->dump_all || step == 0) {
+                dit_dump_gpu(dit, modulation, "b0_adaln_mod_table", 0,
+                             SLOTS * HIDDEN);
+            }
+            if (!dit->dump_all || step == 0) {
+                dit_dump_gpu(dit, rope_cos, "b0_rope_cos_bf16", rows, ROPE_HALF);
+                dit_dump_gpu(dit, rope_sin, "b0_rope_sin_bf16", rows, ROPE_HALF);
+                dit_dump_gpu(dit, weight->norm1, "b0_norm1_w", 1, HIDDEN);
+                dit_dump_gpu(dit, weight->q_norm, "b0_q_norm_w", 1, HEAD_DIM);
+                dit_dump_gpu(dit, weight->k_norm, "b0_k_norm_w", 1, HEAD_DIM);
+                dit_dump_gpu(dit, weight->norm2, "b0_norm2_w", 1, HIDDEN);
+            }
+            if (index == 0 && (!dit->dump_all || step == 0)) {
+                dit_dump_gpu(dit, weight->qkv, "b0_qkv_w", 0, HIDDEN);
+                dit_dump_gpu(dit, weight->out, "b0_out_w", 0, INNER);
+                dit_dump_gpu(dit, weight->fc1, "b0_fc1_w", 0, HIDDEN);
+                dit_dump_gpu(dit, weight->fc2, "b0_fc2_w", 0, FFN);
+            }
             if (!dit_dump_resume(dit))
                 fprintf(stderr, "h3 dump: resume failed at b0 input\n");
         } else
@@ -2231,7 +2249,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->dump_active && index == 0 && step == 0) {
+    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->mod_attention, "b0_attn_adaln_out",
                          rows, HIDDEN);
@@ -2258,7 +2276,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
-    if (dit->dump_active && index == 0 && step == 0) {
+    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->qkv, "b0_qkv_pre_norm", rows, 3u * INNER);
             dit_dump_gpu(dit, dit->query, "b0_q_post_qknorm_rope",
@@ -2300,7 +2318,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
-    if (dit->dump_active && index == 0 && step == 0) {
+    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->attention_heads, "b0_attention_out",
                          rows, INNER);
@@ -2363,7 +2381,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
     }
-    if (dit->dump_active && index == 0 && step == 0) {
+    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->attention_output, "b0_out_proj_out",
                          dit->ssd_streaming ? rows + 1u : rows, HIDDEN);
@@ -2399,7 +2417,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
            "DiT MLP AdaLN");
     }
-    if (dit->dump_active && index == 0 && step == 0) {
+    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->hidden, "b0_post_attn_hidden", rows,
                          HIDDEN);
@@ -2440,7 +2458,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
     }
-    if (dit->dump_active && index == 0 && step == 0) {
+    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->fc1, "b0_fc1_out", rows, FFN * 2);
             dit_dump_gpu(dit, dit->activated, "b0_swiglu_out", rows, FFN);
@@ -2480,7 +2498,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->hidden, dit->hidden, mlp_output,
             modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
     }
-    if (dit->dump_active && index == 0 && step == 0) {
+    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
         dit->dump_done = 1;
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->hidden, "b0_block_out", rows, HIDDEN);
@@ -2835,6 +2853,31 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             dit->video_output, dit->video_rows * VIDEO_PATCH),
            "final video output cast");
     }
+    if (dit->dump_active && dit->dump_all && !fused_final_head) {
+        if (dit_dump_pause(dit)) {
+            char tag[96];
+            snprintf(tag, sizeof(tag), "s%d_final_video_norm_bf16", step);
+            dit_dump_gpu(dit, dit->final_video_norm, tag,
+                         (uint32_t)dit->video_rows, HIDDEN);
+            snprintf(tag, sizeof(tag), "s%d_final_video_map_u32", step);
+            dit_dump_gpu(dit, dit->final_video_maps[step], tag,
+                         (uint32_t)dit->video_rows, 1);
+            snprintf(tag, sizeof(tag), "s%d_final_mod_bf16", step);
+            dit_dump_gpu(dit, final, tag, 0, FINAL_SLOTS * HIDDEN);
+            if (step == 0) {
+                dit_dump_gpu(dit, dit->final_video_w, "s0_final_video_w", 0,
+                             HIDDEN);
+                dit_dump_gpu(dit, dit->final_video_b, "s0_final_video_b", 1,
+                             VIDEO_PATCH);
+                dit_dump_gpu(dit, dit->final_norm, "s0_final_norm_w", 1,
+                             HIDDEN);
+            }
+            if (!dit_dump_resume(dit))
+                fprintf(stderr, "h3 dump: resume failed at final head taps\n");
+        } else {
+            fprintf(stderr, "h3 dump: pause failed at final head taps\n");
+        }
+    }
     if (submit) OP(h3_gpu_submit(dit->gpu), "submit DiT forward");
 #undef OP
     return 1;
@@ -3112,11 +3155,42 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
     if (!ok) fail(error, error_size, "cannot pack/write GPU Euler latents");
     if (ok && h3_dump_dir() && !dit->dump_done) {
         dit->dump_active = 1;
+        dit->dump_all = getenv("H3_DUMP_ALL") != NULL;
+        dit->dump_step = -1;
+        dit->dump_block = 0;
         dit_dump_raw(dit, video_rows,
                      (size_t)dit->video_rows * VIDEO_PATCH *
                          sizeof(*video_rows),
                      "step0_denoise_input_latents",
                      (uint32_t)dit->video_rows, VIDEO_PATCH, "f32");
+        char meta[1024];
+        snprintf(meta, sizeof(meta), "%s/meta.txt", h3_dump_dir());
+        FILE *meta_file = fopen(meta, "wb");
+        if (meta_file) {
+            fprintf(meta_file, "steps %d\nsequence %u\nvideo_rows %u\n"
+                            "video_total_rows %u\nvideo_condition_rows %u\n"
+                            "video_target_start %u\naudio_rows %u\n"
+                            "audio_total_rows %u\naudio_target_start %u\n"
+                            "latent_t %d\nlatent_h %d\nlatent_w %d\n"
+                            "audio_t %d\ntoken_reduction %d\n"
+                            "core_reuse_interval %u\nactive_block_count %u\n"
+                            "dump_all %d\nspatial_rope_scale %.9g\n",
+                    dit->sigmas.steps, dit->sequence, dit->video_rows,
+                    dit->video_total_rows, dit->video_condition_rows,
+                    dit->video_target_start, dit->audio_rows,
+                    dit->audio_total_rows, dit->audio_target_start,
+                    dit->latent_t, dit->latent_h, dit->latent_w,
+                    dit->audio_t, dit->token_reduction,
+                    dit->core_reuse_interval, dit->active_block_count,
+                    dit->dump_all, dit->spatial_rope_scale);
+            for (int i = 0; i <= dit->sigmas.steps; i++) {
+                fprintf(meta_file, "sigma_video %d %.9g\n", i,
+                        dit->sigmas.video[i]);
+                fprintf(meta_file, "sigma_audio %d %.9g\n", i,
+                        dit->sigmas.audio[i]);
+            }
+            fclose(meta_file);
+        }
     }
 
     int last_evaluated = -1;
@@ -3181,7 +3255,8 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                 audio_ratio), error, error_size, "GPU audio Euler step");
         if (ok && (evaluate || preview)) {
             int finish = preview || step + 1 == dit->sigmas.steps ||
-                         (window && pending_evaluations >= window);
+                         (window && pending_evaluations >= window) ||
+                         dit->dump_all;
             ok = gpu_op(dit, finish ? h3_gpu_submit(dit->gpu)
                                     : h3_gpu_continue(dit->gpu),
                         error, error_size,
@@ -3209,6 +3284,15 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                 ok = 0;
             }
         }
+        if (ok && dit->dump_active && dit->dump_all && (evaluate || preview)) {
+            char tag[96];
+            snprintf(tag, sizeof(tag), "s%d_velocity_bf16", step);
+            dit_dump_gpu(dit, dit->video_output_bf16, tag,
+                         (uint32_t)dit->video_rows, VIDEO_PATCH);
+            snprintf(tag, sizeof(tag), "s%d_video_latent_f32", step);
+            dit_dump_gpu(dit, dit->video_input, tag,
+                         dit->video_total_rows, VIDEO_PATCH);
+        }
         if (ok) report(progress, progress_opaque, "denoise enqueue", step + 1,
                        dit->sigmas.steps);
     }
@@ -3220,12 +3304,20 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
             ? dit->reduced_sequence : (uint32_t)dit->video_rows;
         dit_dump_gpu(dit, dit->video_output_bf16, "step0_velocity_bf16",
                      velocity_rows, VIDEO_PATCH);
-        dit->dump_active = 0;
     }
     if (ok) ok = h3_gpu_tensor_read_f32_range(
                      dit->video_input, video_offset, video_rows, video_count) &&
                  h3_gpu_tensor_read_f32_range(
                      dit->audio_input, audio_offset, audio_rows, audio_count);
+    if (ok && dit->dump_active) {
+        if (dit->dump_all)
+            dit_dump_raw(dit, video_rows,
+                         (size_t)dit->video_rows * VIDEO_PATCH *
+                             sizeof(*video_rows),
+                         "video_latent_final_f32",
+                         (uint32_t)dit->video_rows, VIDEO_PATCH, "f32");
+        dit->dump_active = 0;
+    }
     if (!ok && (!error || !*error))
         fail(error, error_size, "cannot read GPU Euler latents");
     if (ok) ok = h3_dit_unpatchify_video(
