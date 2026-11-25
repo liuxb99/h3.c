@@ -57,7 +57,7 @@ MPS 基準測試。
 | 資產 | 路徑 | 大小 | 狀態 |
 |---|---|---|---|
 | 基幹 FL2VA 原版 bf16（13 shards） | SSD5 掛載點（**未掛載**） | 62G | BLOCKED→改由 HF 重下 |
-| 基幹 Ref2VA 原版 bf16 | /Volumes/SSD2T/models/MiniMax-H3-ref2va/transformer（下載中） | 62G | 進行中（HF 公開、免 token） |
+| 基幹 Ref2VA 原版 bf16 | /Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3-flex-ref2va/Ref2VA/transformer（13/13 標頭健檢 PASS，見 evidence/資產溯源） | 62G | 已到位 |
 | TE Qwen3-VL bf16 | SSD2T/…/AI-h3-metal-MiniMax-H3/text_encoder | 62G | ✅ 現成 |
 | VAE（video fp32 佈局）＋audio VAE | 同上 vae/、audio_vae/ | 9.7G+0.56G | ✅ |
 | tokenizer/processor | 同上 | 小檔 | ✅ |

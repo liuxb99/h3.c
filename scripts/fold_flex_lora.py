@@ -94,12 +94,14 @@ def main():
     import shutil
     # 複製非 shard 檔案（config 等）
     for fn in os.listdir(args.base):
+        if fn.startswith("._") or fn.startswith("."):
+            continue  # AppleDouble 垃圾（exFAT 副本）
         if fn.endswith(".safetensors") or fn.startswith("model.safetensors.index"):
             continue
         shutil.copy2(os.path.join(args.base, fn), os.path.join(args.out, fn))
 
     for fn in sorted(os.listdir(args.base)):
-        if not fn.endswith(".safetensors"):
+        if not fn.endswith(".safetensors") or fn.startswith("._"):
             continue
         src = os.path.join(args.base, fn)
         touched = [k for k in per_shard.get(fn, [])]
