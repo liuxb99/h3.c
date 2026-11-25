@@ -1621,6 +1621,20 @@ int h3_gpu_sdpa_bf16_head_major_output(
                        1);
 }
 
+const unsigned char *h3_gpu_tensor_bytes(h3_gpu_tensor *tensor, size_t *length) {
+    if (!tensor) return NULL;
+    if (length) *length = TENSOR(tensor).buffer.length;
+    return TENSOR(tensor).buffer.contents;
+}
+
+int h3_gpu_zero_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                     uint32_t rows, uint32_t cols) {    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_elements(gpu, output, (size_t)rows * cols, @"zero"))
+        return 0;
+    memset(TENSOR(output).buffer.contents, 0, TENSOR(output).buffer.length);
+    return 1;
+}
+
 int h3_gpu_swiglu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                       const h3_gpu_tensor *fused, uint32_t rows,
                       uint32_t width) {
@@ -4739,7 +4753,6 @@ int h3_gpu_sol_sdpa_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     uint32_t nqb = (sequence + block - 1u) / block;
     size_t qkv_count = (size_t)sequence * heads * head_dim;
     size_t pooled_count = (size_t)3u * heads * nqb * 128u;
-    size_t scores_count = (size_t)heads * nqb * nqb;
     if (!h3_gpu_require_bf16(gpu, query, qkv_count, @"sol query") ||
         !h3_gpu_require_bf16(gpu, key, qkv_count, @"sol key") ||
         !h3_gpu_require_bf16(gpu, value, qkv_count, @"sol value") ||

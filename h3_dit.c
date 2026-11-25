@@ -1669,8 +1669,8 @@ static h3_dit *load_dit(const char *weight_directory,
     {
         const char *sol = getenv("H3_SOL_ATTN");
         dit->sol_attn_tau = sol ? (float)atof(sol) : 0.0f;
-        if (sol && dit->sol_attn_tau <= 0.0f) dit->sol_attn_tau = 1.3f;
-        if (dit->sol_attn_tau > 0.0f && !dit->ssd_streaming &&
+        if (sol && dit->sol_attn_tau == 0.0f) dit->sol_attn_tau = 1.3f;
+        if (dit->sol_attn_tau != 0.0f && !dit->ssd_streaming &&
             dit->sequence >= 512u) {
             uint32_t nqb = (dit->sequence + 127u) / 128u;
             dit->sol_scratch_nqb = nqb;
@@ -1962,10 +1962,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT head-major full attention");
-    else if (dit->sol_attn_tau > 0.0f && dit->sol_scratch_nqb &&
+    else if (dit->sol_attn_tau != 0.0f && dit->sol_scratch_nqb &&
              !dit->token_reduction_active && rows == dit->sequence &&
-             index >= 2u)
-        OP(h3_gpu_sol_sdpa_bf16(
+             index >= 2u) {
+        if (!getenv("H3_SOL_ZERO_OUT"))
+            OP(h3_gpu_sol_sdpa_bf16(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), 128u,
             dit->video_target_start, dit->video_target_start + dit->video_rows,
@@ -1973,11 +1974,47 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->sol_thresholds, dit->sol_sel_offsets,
             dit->sol_sel_indices),
            "DiT Sol-Attn block-sparse attention");
-    else
+        else
+            OP(h3_gpu_zero_bf16(dit->gpu, dit->attention_heads, rows, INNER),
+               "DiT Sol-Attn zero-out probe");
+    } else
         OP(h3_gpu_sdpa_bf16(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
+    {
+        static const char *dump_dir = NULL;
+        static int dump_done = 0;
+        if (!dump_done) {
+            if (!dump_dir) dump_dir = getenv("H3_DUMP_DIR");
+            if (dump_dir && *dump_dir && index == 2u) {
+                dump_done = 1;
+                h3_gpu_submit(dit->gpu);
+                static const char *names[9] = {"q", "k", "v", "heads",
+                    "pooled", "scores", "thresholds", "sel_offsets",
+                    "sel_indices"};
+                h3_gpu_tensor *tensors[9] = {dit->query, dit->key,
+                    dit->value, dit->attention_heads, dit->sol_pooled,
+                    dit->sol_scores, dit->sol_thresholds,
+                    dit->sol_sel_offsets, dit->sol_sel_indices};
+                for (int d = 0; d < 9; d++) {
+                    size_t len = 0;
+                    const unsigned char *bytes =
+                        h3_gpu_tensor_bytes(tensors[d], &len);
+                    if (!bytes || !len) continue;
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s/%s.bin", dump_dir,
+                             names[d]);
+                    FILE *f = fopen(path, "wb");
+                    if (f) {
+                        fwrite(bytes, 1, len, f);
+                        fclose(f);
+                    }
+                }
+                fprintf(stderr, "h3: sol dump complete rows=%u\n", rows);
+            }
+        }
+    }
     if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(

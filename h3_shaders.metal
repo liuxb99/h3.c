@@ -4344,7 +4344,8 @@ kernel void h3_sol_block_pool_bf16(
         device ushort *pooled [[buffer(3)]],
         constant sol_pool_args &args [[buffer(4)]],
         uint3 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]]) {
+        uint3 posn [[thread_position_in_threadgroup]]) {
+    uint tid = posn.x;
     uint i = group.x, h = group.y, which = group.z;
     uint nqb = (args.sequence + args.block - 1u) / args.block;
     if (i >= nqb || h >= args.heads) return;
@@ -4355,7 +4356,7 @@ kernel void h3_sol_block_pool_bf16(
     size_t out = ((size_t)which * args.heads + h) * nqb * 128u + (size_t)i * 128u;
     if (count == 0u) { if (tid < 128u) pooled[out + tid] = 0u; return; }
     float sum = 0.0f;
-    for (uint row = lo + tid; row < hi; row += 128u)
+    for (uint row = lo; row < hi; ++row)
         sum += h3_bf16_to_f32(src[((size_t)row * args.heads + h) * 128u + tid]);
     pooled[out + tid] = h3_f32_to_bf16(sum / (float)count);
 }
@@ -4367,8 +4368,8 @@ kernel void h3_sol_block_scores_bf16(
         device float *thresholds [[buffer(2)]],
         constant sol_scores_args &args [[buffer(3)]],
         uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]]) {
-    uint h = group.x, i = group.y * 128u + tid;
+        uint2 tid [[thread_position_in_threadgroup]]) {
+    uint h = group.x, i = group.y * 128u + tid.x;
     if (i >= args.nqb) return;
     size_t cq = ((size_t)h * args.nqb + i) * 128u;
     uint block0 = i * 128u, block1 = block0 + 128u;
@@ -4395,9 +4396,6 @@ kernel void h3_sol_block_scores_bf16(
         }
         mean = sum / (float)count;
         var = max(sum2 / (float)count - mean * mean, 0.0f);
-        if (pass == 0u) { /* second pass stores scores; mean/var carried */
-            float m2 = mean; mean = mean; m2 = m2;
-        }
     }
     thresholds[(size_t)h * args.nqb + i] = fully ? mean + args.tau * sqrt(var)
                                                   : 1.0e30f;
@@ -4416,7 +4414,6 @@ kernel void h3_sol_block_select_bf16(
      * in parallel, then thread 0 performs the (short) serial prefix sum;
      * index lists are written by row threads in ascending block order. */
     uint nqb = args.nqb;
-    uint count = 0u;
     float threshold = 1.0e30f;
     size_t row = 0u;
     if (h < args.heads) {
@@ -4465,16 +4462,16 @@ kernel void h3_sol_attn_bf16(
         device const uint *sel_offsets [[buffer(7)]],
         device const uint *sel_indices [[buffer(8)]],
         uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]]) {
+        uint2 tid [[thread_position_in_threadgroup]]) {
     uint i = group.x, h = group.y;
-    uint row = i * args.block + tid;
+    uint row = i * args.block + tid.x;
     if (row >= args.sequence) return;
     uint nqb = args.nqb;
     bool target = row >= args.video_start && row < args.video_stop;
     size_t qbase = ((size_t)row * args.heads + h) * 128u;
     device const ushort *qrow = query + qbase;
-    private float acc[128];
-    private float keyscores[64];
+    float acc[128];
+    float keyscores[64];
     float m = -INFINITY, l = 0.0f;
     for (uint d = 0u; d < 128u; d++) acc[d] = 0.0f;
 
