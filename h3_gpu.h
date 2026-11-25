@@ -312,6 +312,24 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         uint32_t output_dim);
 /* Experimental M5 Metal 4 int8 MLP. Weights use one F32 scale per output
  * channel; activations are quantized dynamically with one F32 scale per row. */
+/* Materialize dequantized BF16 from int8 payload plus per-row float
+   scales (Comfy int8_tensorwise checkpoints). */
+int h3_gpu_dequant_int8_rows(h3_gpu *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *scales,
+                             uint32_t rows, uint32_t columns);
+/* Comfy convrot int8_tensorwise: folds inverse Hadamard rotation,
+   optional row permutation (interleaved qkv rows from blocked files)
+   and scales into the dequant.  had is the group-size Hadamard
+   (+-1 entries, row-major, uploaded once per group size); rowmap may
+   be NULL. */
+int h3_gpu_dequant_convrot(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *scales,
+                           const h3_gpu_tensor *had,
+                           const h3_gpu_tensor *rowmap,
+                           uint32_t rows, uint32_t columns,
+                           uint32_t groupsize);
 int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,

@@ -1,6 +1,7 @@
 #include "h3_weights.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -164,6 +165,110 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
         break;
     }
     return NULL;
+}
+
+int h3_weight_is_quantized(const h3_weight_store *store, const char *name) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    char sidecar[1024];
+    if (!tensor || (tensor->dtype != H3_DTYPE_I8 &&
+                    tensor->dtype != H3_DTYPE_U8)) return 0;
+    /* Comfy files key sidecars by stem: <stem>.weight + <stem>_scale +
+       <stem>_quant...  actually <stem>.weight_scale / <stem>.comfy_quant;
+       accept the appended spelling too. */
+    if (strlen(name) > 7 && !strcmp(name + strlen(name) - 7, ".weight")) {
+        char stem[1024];
+        snprintf(stem, sizeof stem, "%.*s",
+                 (int)(strlen(name) - 7), name);
+        snprintf(sidecar, sizeof sidecar, "%s.comfy_quant", stem);
+        if (h3_weight_find(store, sidecar, &header)) return 1;
+    }
+    snprintf(sidecar, sizeof sidecar, "%s.comfy_quant", name);
+    return h3_weight_find(store, sidecar, &header) != NULL;
+}
+
+static int sidecar_name_for(const char *name, char *sidecar, size_t size) {
+    size_t length = strlen(name);
+    if (length > 7 && !strcmp(name + length - 7, ".weight")) {
+        snprintf(sidecar, size, "%.*s.comfy_quant", (int)(length - 7), name);
+        if (length + 14 >= size) return -1;
+        return 1;
+    }
+    snprintf(sidecar, size, "%s.comfy_quant", name);
+    return 0;
+}
+
+int h3_weight_quant_info(const h3_weight_store *store, const char *name,
+                         uint32_t *groupsize, int *convrot,
+                         char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = NULL;
+    char sidecar[1024];
+    int tried = sidecar_name_for(name, sidecar, sizeof sidecar);
+    tensor = h3_weight_find(store, sidecar, &header);
+    if (!tensor && tried == 1) {
+        snprintf(sidecar, sizeof sidecar, "%s.comfy_quant", name);
+        tensor = h3_weight_find(store, sidecar, &header);
+    }
+    if (!tensor) {
+        fail(error, error_size, "quantized weight lacks sidecar: %s", name);
+        return 0;
+    }
+    if (tensor->dtype != H3_DTYPE_U8 && tensor->dtype != H3_DTYPE_I8) {
+        fail(error, error_size, "sidecar %s has dtype %s", sidecar,
+             h3_dtype_name(tensor->dtype));
+        return 0;
+    }
+    uint64_t bytes = tensor->data_end - tensor->data_begin;
+    if (!bytes || bytes > 4096) {
+        fail(error, error_size, "sidecar %s has %llu bytes", sidecar,
+             (unsigned long long)bytes);
+        return 0;
+    }
+    char buffer[4097];
+    FILE *stream = fopen(header->path, "rb");
+    if (!stream) {
+        fail(error, error_size, "cannot open %s: %s", header->path,
+             strerror(errno));
+        return 0;
+    }
+    size_t read = 0;
+    if (fseeko(stream, (off_t)tensor->file_offset, SEEK_SET) == 0)
+        read = fread(buffer, 1, (size_t)bytes, stream);
+    fclose(stream);
+    if (read != (size_t)bytes) {
+        fail(error, error_size, "cannot read sidecar %s", sidecar);
+        return 0;
+    }
+    buffer[bytes] = '\0';
+    /* Gate: this engine only consumes Comfy int8_tensorwise payloads. */
+    if (!strstr(buffer, "\"format\"") || !strstr(buffer, "int8_tensorwise")) {
+        fail(error, error_size, "unsupported quant format for %s: %s", name,
+             buffer);
+        return 0;
+    }
+    int convrot_true = strstr(buffer, "\"convrot\": true") ||
+                       strstr(buffer, "\"convrot\":true");
+    uint32_t group = 0;
+    const char *key = strstr(buffer, "convrot_groupsize");
+    if (key) {
+        key = strchr(key, ':');
+        if (key) group = (uint32_t)strtoul(key + 1, NULL, 10);
+    }
+    if (convrot_true) {
+        if (!group || (group & (group - 1)) || group > 256) {
+            fail(error, error_size,
+                 "convrot sidecar for %s lacks a usable groupsize: %s", name,
+                 buffer);
+            return 0;
+        }
+        *convrot = 1;
+        *groupsize = group;
+        return 1;
+    }
+    *convrot = 0;
+    *groupsize = 0;
+    return 1;
 }
 
 static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,

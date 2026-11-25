@@ -10,6 +10,7 @@
 #include "h3_tokenizer.h"
 #include "h3_video_encoder.h"
 #include "h3_video_vae.h"
+#include "h3_weights.h"
 #include "h3_vision_encoder.h"
 
 #include <dirent.h>
@@ -493,8 +494,12 @@ h3_ctx *h3_load_dir(const char *model_dir) {
             h3_free(ctx);
             return NULL;
         }
+        /* The quantized files cover transformer and text encoder.  The
+           auxiliary pack still supplies the BF16 original text encoder
+           under the exact names the consumer resolves by. */
         if (!h3_inventory(ctx, ".", &ctx->model.fl2va_transformer) ||
-            !h3_inventory(ctx, ".", &ctx->model.text_encoder)) {
+            !h3_inventory(ctx, "FL2VA/text_encoder",
+                          &ctx->model.text_encoder)) {
             snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
             h3_free(ctx);
             return NULL;
@@ -509,6 +514,11 @@ h3_ctx *h3_load_dir(const char *model_dir) {
             return NULL;
         }
     }
+    fprintf(stderr, "\n[h3-layout mode=%d te_files=%zu te_bytes=%llu "
+                    "dit_files=%zu]\n",
+            layout_mode, ctx->model.text_encoder.files,
+            (unsigned long long)ctx->model.text_encoder.bytes,
+            ctx->model.fl2va_transformer.files);
     if (!h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
         !h3_inventory(ctx, "FL2VA/audio_vae", &ctx->model.audio_vae)) {
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);

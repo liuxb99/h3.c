@@ -1317,6 +1317,71 @@ kernel void h3_fc1_swiglu_bf16_nax_r128_morton4(
 /* Draw Things/ccv-style dynamic symmetric row quantization. Weight rows are
  * checkpoint output channels; activation rows include zero-padded M tails so
  * the int8 matmuls can keep a fully static 128x128x128 descriptor. */
+kernel void h3_dequant_int8_rows(device const int8_t *input [[buffer(0)]],
+                                  device ushort *output [[buffer(1)]],
+                                  device const float *scales [[buffer(2)]],
+                                  constant int8_quant_args &args [[buffer(3)]],
+                                  uint tid [[thread_position_in_grid]],
+                                  uint tptg [[threads_per_threadgroup]],
+                                  uint tpg_x [[threadgroups_per_grid_x]]) {
+    device char4 *input4 = reinterpret_cast<device char4 *>(input);
+    device ushort4 *output4 = reinterpret_cast<device ushort4 *>(output);
+    uint vectors = args.rows * (args.columns / 4);
+    uint stride = tpg_x * tptg;
+    for (uint vector = tid; vector < vectors; vector += stride) {
+        uint row = vector / (args.columns / 4);
+        float scale = scales[row];
+        char4 value = input4[vector];
+        output4[vector] = ushort4(
+            h3_f32_to_bf16((float)value.x * scale),
+            h3_f32_to_bf16((float)value.y * scale),
+            h3_f32_to_bf16((float)value.z * scale),
+            h3_f32_to_bf16((float)value.w * scale));
+    }
+}
+
+/* Comfy convrot int8_tensorwise weights: the file stores the *rotated*
+ * weight (W_rot = W @ H_group^T, regular normalized Hadamard over
+ * group-size blocks of the reduction axis) with per-row F32 scales, and
+ * qkv tensors additionally have their rows permuted from the native
+ * per-head interleaved order into q/k/v blocks.  This kernel folds the
+ * inverse rotation (multiply by H, symmetric), the row permutation and
+ * the scale into the dequant so consumers receive the exact original
+ * BF16 weight.  had is the H matrix transposed (had[j*G+k]) uploaded
+ * once per group size. */
+typedef struct { uint32_t rows, columns, groupsize, has_map; float invsqrt; } convrot_dequant_args;
+
+kernel void h3_dequant_convrot_rows(
+                       device const int8_t *input [[buffer(0)]],
+                       device ushort *output [[buffer(1)]],
+                       device const float *scales [[buffer(2)]],
+                       constant convrot_dequant_args &args [[buffer(3)]],
+                       device const uint *rowmap [[buffer(4)]],
+                       device const float *had [[buffer(5)]],
+                       uint tgid_x [[threadgroup_position_in_grid]],
+                       uint tgid_y [[threadgroup_position_in_grid_y]],
+                       uint tid [[thread_position_in_threadgroup]]) {
+    uint row = tgid_x;
+    uint block = tgid_y;
+    uint groups = args.columns / args.groupsize;
+    if (row >= args.rows || block >= groups) return;
+    uint src = args.has_map ? rowmap[row] : row;
+    threadgroup int8_t block_values[256];
+    if (tid < args.groupsize) {
+        block_values[tid] = input[src * args.columns + block * args.groupsize
+                                  + tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid >= args.groupsize) return;
+    float acc = 0.0f;
+    device const float *had_row = had + (size_t)tid * args.groupsize;
+    for (uint k = 0; k < args.groupsize; k++) {
+        acc += (float)block_values[k] * had_row[k];
+    }
+    output[row * args.columns + block * args.groupsize + tid] =
+        h3_f32_to_bf16(acc * scales[src] * args.invsqrt);
+}
+
 kernel void h3_quantize_bf16_int8_rows(
                            device const bfloat *input [[buffer(0)]],
                            device int8_t *output [[buffer(1)]],

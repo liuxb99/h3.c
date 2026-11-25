@@ -982,6 +982,8 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
+typedef struct { uint32_t rows, columns, groupsize, has_map; float invsqrt; }
+    convrot_dequant_args;
 typedef struct {
     uint32_t rows, padded_rows, heads, head_dim;
     float clip;
@@ -2966,6 +2968,111 @@ int h3_gpu_quantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,
     return h3_gpu_quantize_bf16_int8_rows(
         opaque, output, scales, input, rows, rows, columns,
         1.0f, @"BF16 weight to quantize");
+}
+
+int h3_gpu_dequant_int8_rows(h3_gpu *opaque, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *scales,
+                             uint32_t rows, uint32_t columns) {
+    H3GPU *gpu = GPU(opaque);
+    int started = 0;
+    if (!gpu || !rows || !columns || (columns % 4) ||
+        !h3_gpu_require_i8(gpu, input, (size_t)rows * columns,
+                           @"int8 dequant input") ||
+        !h3_gpu_require_f32(gpu, scales, rows,
+                            @"int8 dequant scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * columns,
+                             @"int8 dequant output")) return 0;
+    if (!gpu.command) {
+        if (!h3_gpu_begin(opaque)) return 0;
+        started = 1;
+    }
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_dequant_int8_rows");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        if (started) h3_gpu_submit(opaque);
+        return 0;
+    }
+    int8_quant_args args = {rows, columns, 0};
+    size_t vectors = (size_t)rows * (columns / 4);
+    size_t threads = vectors < (size_t)65535 * 256 ? vectors : (size_t)65535 * 256;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((threads + 255) / 256, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    if (started) return h3_gpu_submit(opaque);
+    return 1;
+}
+
+int h3_gpu_dequant_convrot(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *scales,
+                           const h3_gpu_tensor *had,
+                           const h3_gpu_tensor *rowmap,
+                           uint32_t rows, uint32_t columns,
+                           uint32_t groupsize) {
+    H3GPU *gpu = GPU(opaque);
+    int started = 0;
+    if (!gpu || !rows || !columns || !groupsize || groupsize > 256 ||
+        (columns % groupsize) || (groupsize & (groupsize - 1)) ||
+        !h3_gpu_require_i8(gpu, input, (size_t)rows * columns,
+                           @"convrot dequant input") ||
+        !h3_gpu_require_f32(gpu, scales, rows,
+                            @"convrot dequant scales") ||
+        !h3_gpu_require_f32(gpu, had, (size_t)groupsize * groupsize,
+                            @"convrot Hadamard") ||
+        !h3_gpu_require_elements(gpu, rowmap, rows, @"convrot rowmap") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * columns,
+                             @"convrot dequant output")) return 0;
+    if (!gpu.command) {
+        if (!h3_gpu_begin(opaque)) return 0;
+        started = 1;
+    }
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_dequant_convrot_rows");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        if (started) h3_gpu_submit(opaque);
+        return 0;
+    }
+    convrot_dequant_args args = {rows, columns, groupsize,
+                                  rowmap ? 1u : 0u,
+                                  1.0f / sqrtf((float)groupsize)};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        if (rowmap) {
+            [encoder setBuffer:TENSOR(rowmap).buffer offset:0 atIndex:4];
+        } else {
+            [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:4];
+        }
+        [encoder setBuffer:TENSOR(had).buffer offset:0 atIndex:5];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake(rows, columns / groupsize, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    if (started) return h3_gpu_submit(opaque);
+    return 1;
 }
 
 static int h3_gpu_linear_int8_bf16_layout(

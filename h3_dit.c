@@ -71,6 +71,10 @@ struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
+    /* Cached +-1 Hadamard matrices (transposed storage) for convrot
+       int8 weight dequantization, one slot per group size. */
+    h3_gpu_tensor *had_tensors[4];
+    uint32_t had_sizes[4];
     int fused_mlp;
     int nax_mlp;
     int int8_mlp;
@@ -246,8 +250,186 @@ static h3_gpu_tensor *bf1(h3_dit *dit, const char *name, uint64_t width,
                                error, error_size);
 }
 
+/* Fetch (or build and cache) the transposed +-1 Hadamard matrix of a
+   group size for convrot dequantization.  Entry [j*G + k] holds H[k][j]
+   so the Metal kernel reads coalesced rows; the kernel applies the 1/
+   sqrt(G) normalization itself, so only +-1 signs live on the GPU.
+   Verified numerically against Comfy checkpoints: file rows equal the
+   original weight rows rotated by this H (corr = 1.0000). */
+static h3_gpu_tensor *dit_had(h3_dit *dit, uint32_t groupsize,
+                              char *error, size_t error_size) {
+    size_t empty = 4;
+    for (size_t slot = 0; slot < 4; slot++) {
+        if (dit->had_sizes[slot] == groupsize && dit->had_tensors[slot])
+            return dit->had_tensors[slot];
+        if (!dit->had_tensors[slot] && empty == 4) empty = slot;
+    }
+    if (empty == 4) {
+        fail(error, error_size, "no Hadamard cache slot for group %u",
+             groupsize);
+        return NULL;
+    }
+    static const float h4[4][4] = {
+        {1.0f, 1.0f, 1.0f, -1.0f}, {1.0f, 1.0f, -1.0f, 1.0f},
+        {1.0f, -1.0f, 1.0f, 1.0f}, {-1.0f, 1.0f, 1.0f, 1.0f}};
+    size_t width = 1;
+    float *had = malloc((size_t)groupsize * groupsize * sizeof(*had));
+    if (!had) {
+        fail(error, error_size, "out of memory building Hadamard %u",
+             groupsize);
+        return NULL;
+    }
+    had[0] = 1.0f;
+    while (width < groupsize) {
+        float *grown = malloc(width * width * 16 * sizeof(*grown));
+        if (!grown) {
+            fail(error, error_size, "out of memory growing Hadamard %u",
+                 groupsize);
+            free(had);
+            return NULL;
+        }
+        for (size_t i = 0; i < width; i++)
+            for (size_t j = 0; j < width; j++)
+                for (int k = 0; k < 4; k++)
+                    for (int l = 0; l < 4; l++)
+                        grown[(i * 4 + k) * width * 4 + j * 4 + l] =
+                            had[i * width + j] * h4[k][l];
+        free(had);
+        had = grown;
+        width *= 4;
+    }
+    /* had currently holds H row-major; transpose in place by pair swap
+       so [j*G + k] = H[k][j]. */
+    for (size_t j = 0; j < groupsize; j++)
+        for (size_t k = j + 1; k < groupsize; k++) {
+            float hold = had[j * groupsize + k];
+            had[j * groupsize + k] = had[k * groupsize + j];
+            had[k * groupsize + j] = hold;
+        }
+    h3_gpu_tensor *tensor = h3_gpu_tensor_from_f32(dit->gpu, had,
+                                                   (size_t)groupsize *
+                                                   groupsize);
+    free(had);
+    if (!tensor) {
+        fail(error, error_size, "cannot upload Hadamard %u: %s", groupsize,
+             h3_gpu_error(dit->gpu));
+        return NULL;
+    }
+    dit->had_tensors[empty] = tensor;
+    dit->had_sizes[empty] = groupsize;
+    return tensor;
+}
+
 static h3_gpu_tensor *bf2(h3_dit *dit, const char *name, uint64_t rows,
                           uint64_t columns, char *error, size_t error_size) {
+    if (h3_weight_is_quantized(dit->weights, name)) {
+        /* Comfy int8 checkpoint: file holds I8 payload plus per-row F32
+           scales plus a comfy_quant sidecar (semantics gate checked at
+           registration).  Materialize BF16 on the GPU here; every
+           downstream consumer, including runtime requantization, then
+           behaves exactly as in the BF16 baseline. */
+        char detail[512];
+        char scale_name[1024];
+        static int dequant_hits;
+        if (++dequant_hits % 50 == 1)
+            fprintf(stderr, "\n[comfy-int8 dequant #%d %s]\n",
+                    dequant_hits, name);
+        uint32_t groupsize = 0;
+        int convrot = 0;
+        if (!h3_weight_quant_info(dit->weights, name, &groupsize, &convrot,
+                                  detail, sizeof detail)) {
+            fail(error, error_size, "%s: %s", name, detail);
+            return 0;
+        }
+        uint64_t weight_shape[] = {rows, columns};
+        uint64_t scale_shape[] = {rows, 1};
+        h3_gpu_tensor *weight, *scale, *materialized = NULL;
+        if (strlen(name) > 7 && !strcmp(name + strlen(name) - 7, ".weight"))
+            snprintf(scale_name, sizeof scale_name, "%.*s.weight_scale",
+                     (int)(strlen(name) - 7), name);
+        else
+            snprintf(scale_name, sizeof scale_name, "%s.weight_scale", name);
+        weight = h3_weight_load_i8(dit->weights, dit->gpu, name, 2,
+                                   weight_shape, detail, sizeof detail);
+        if (!weight) {
+            fail(error, error_size, "%s: %s", name, detail);
+            return 0;
+        }
+        scale = h3_weight_load_f32(dit->weights, dit->gpu, scale_name, 2,
+                                   scale_shape, detail, sizeof detail);
+        if (!scale) {
+            free_tensor(&weight);
+            fail(error, error_size, "%s: %s", scale_name, detail);
+            return 0;
+        }
+        const h3_gpu_tensor *had = NULL;
+        h3_gpu_tensor *rowmap = NULL;
+        int ok = 0;
+        if (convrot) {
+            had = dit_had(dit, groupsize, detail, sizeof detail);
+            if (!had) goto dequant_failed;
+            if (strstr(name, "attn.qkv_proj.weight")) {
+                /* The checkpoint stores qkv rows grouped q|k|v; the
+                   engine (and the original checkpoint) use per-head
+                   interleaved rows.  Map destination row -> file row. */
+                if (rows % 384) {
+                    fail(error, error_size,
+                         "%s has %llu qkv rows, not a 384 multiple", name,
+                         (unsigned long long)rows);
+                    goto dequant_failed;
+                }
+                uint32_t heads_per_component = (uint32_t)(rows / 384);
+                uint32_t *map = malloc((size_t)rows * sizeof(*map));
+                if (!map) {
+                    fail(error, error_size,
+                         "out of memory building qkv row map");
+                    goto dequant_failed;
+                }
+                for (uint32_t row = 0; row < rows; row++) {
+                    uint32_t head = row / 128;
+                    map[row] = ((head % 3) * heads_per_component +
+                                head / 3) * 128 + row % 128;
+                }
+                rowmap = h3_gpu_tensor_from_u32(dit->gpu, map,
+                                                (size_t)rows);
+                free(map);
+                if (!rowmap) {
+                    fail(error, error_size, "qkv row map: %s",
+                         h3_gpu_error(dit->gpu));
+                    goto dequant_failed;
+                }
+            }
+        }
+        materialized = h3_gpu_tensor_new_bf16(dit->gpu,
+                                              (size_t)rows * columns);
+        if (!materialized) {
+            fail(error, error_size, "out of memory materializing %s", name);
+            goto dequant_failed;
+        }
+        ok = convrot
+            ? h3_gpu_dequant_convrot(dit->gpu, materialized, weight, scale,
+                                     had, rowmap, (uint32_t)rows,
+                                     (uint32_t)columns, groupsize)
+            : h3_gpu_dequant_int8_rows(dit->gpu, materialized, weight,
+                                       scale, (uint32_t)rows,
+                                       (uint32_t)columns);
+        if (!ok) {
+            fail(error, error_size, "%s dequant: %s", name,
+                 h3_gpu_error(dit->gpu));
+            goto dequant_failed;
+        }
+        if (rowmap) free_tensor(&rowmap);
+        free_tensor(&weight);
+        free_tensor(&scale);
+        return materialized;
+      dequant_failed:
+        if (rowmap) free_tensor(&rowmap);
+        if (materialized) free_tensor(&materialized);
+        free_tensor(&weight);
+        free_tensor(&scale);
+        if (!error[0]) fail(error, error_size, "%s dequant failed", name);
+        return 0;
+    }
     uint64_t shape[] = {rows, columns};
     return h3_weight_load_bf16(dit->weights, dit->gpu, name, 2, shape,
                                error, error_size);
@@ -3089,6 +3271,8 @@ void h3_dit_free(h3_dit *dit) {
     free(dit->reduced_row_maps);
     free(dit->final_audio_maps);
     free(dit->final_video_maps);
+    for (size_t slot = 0; slot < 4; slot++)
+        free_tensor(&dit->had_tensors[slot]);
     free_tensor(&dit->refined_text);
     free_tensor(&dit->rope_cos);
     free_tensor(&dit->rope_sin);
