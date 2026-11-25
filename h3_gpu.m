@@ -483,6 +483,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                 @"h3_linear_int8_grouped_local_nax_r128x64"];
             [names addObject:
                 @"h3_linear_int8_grouped_local_nax_r128x128"];
+            [names addObject:@"h3_dequant_int8_rows"];
+            [names addObject:@"h3_dequant_convrot_rows"];
         }
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
@@ -2995,7 +2997,8 @@ int h3_gpu_dequant_int8_rows(h3_gpu *opaque, h3_gpu_tensor *output,
     }
     int8_quant_args args = {rows, columns, 0};
     size_t vectors = (size_t)rows * (columns / 4);
-    size_t threads = vectors < (size_t)65535 * 256 ? vectors : (size_t)65535 * 256;
+    size_t threads = vectors < (size_t)65535 * 1024 ? vectors
+                                                    : (size_t)65535 * 1024;
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
@@ -3005,8 +3008,8 @@ int h3_gpu_dequant_int8_rows(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:2];
         [encoder setBytes:&args length:sizeof(args) atIndex:3];
         [encoder dispatchThreadgroups:
-            MTLSizeMake((threads + 255) / 256, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            MTLSizeMake((threads + 1023) / 1024, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;
@@ -3033,7 +3036,8 @@ int h3_gpu_dequant_convrot(h3_gpu *opaque, h3_gpu_tensor *output,
                             @"convrot dequant scales") ||
         !h3_gpu_require_f32(gpu, had, (size_t)groupsize * groupsize,
                             @"convrot Hadamard") ||
-        !h3_gpu_require_elements(gpu, rowmap, rows, @"convrot rowmap") ||
+        (rowmap != NULL &&
+         !h3_gpu_require_elements(gpu, rowmap, rows, @"convrot rowmap")) ||
         !h3_gpu_require_bf16(gpu, output, (size_t)rows * columns,
                              @"convrot dequant output")) return 0;
     if (!gpu.command) {

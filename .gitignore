@@ -11,3 +11,6 @@ scratch/sol/*
 !scratch/sol/**/*.py
 !scratch/sol/**/*.sh
 !scratch/sol/**/*.md
+build/
+libh3.a
+h3_dit_bench_*

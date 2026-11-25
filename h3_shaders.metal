@@ -1321,14 +1321,14 @@ kernel void h3_dequant_int8_rows(device const int8_t *input [[buffer(0)]],
                                   device ushort *output [[buffer(1)]],
                                   device const float *scales [[buffer(2)]],
                                   constant int8_quant_args &args [[buffer(3)]],
-                                  uint tid [[thread_position_in_grid]],
-                                  uint tptg [[threads_per_threadgroup]],
-                                  uint tpg_x [[threadgroups_per_grid_x]]) {
-    device char4 *input4 = reinterpret_cast<device char4 *>(input);
+                                  uint tid [[thread_position_in_grid]]) {
+    device const char4 *input4 =
+        reinterpret_cast<device const char4 *>(input);
     device ushort4 *output4 = reinterpret_cast<device ushort4 *>(output);
     uint vectors = args.rows * (args.columns / 4);
-    uint stride = tpg_x * tptg;
-    for (uint vector = tid; vector < vectors; vector += stride) {
+    if (tid >= vectors) return;
+    {
+        uint vector = tid;
         uint row = vector / (args.columns / 4);
         float scale = scales[row];
         char4 value = input4[vector];
@@ -1358,27 +1358,27 @@ kernel void h3_dequant_convrot_rows(
                        constant convrot_dequant_args &args [[buffer(3)]],
                        device const uint *rowmap [[buffer(4)]],
                        device const float *had [[buffer(5)]],
-                       uint tgid_x [[threadgroup_position_in_grid]],
-                       uint tgid_y [[threadgroup_position_in_grid_y]],
-                       uint tid [[thread_position_in_threadgroup]]) {
-    uint row = tgid_x;
-    uint block = tgid_y;
+                       uint3 tgid [[threadgroup_position_in_grid]],
+                       uint3 tid [[thread_position_in_threadgroup]]) {
+    uint row = tgid.x;
+    uint block = tgid.y;
+    uint lane = tid.x;
     uint groups = args.columns / args.groupsize;
     if (row >= args.rows || block >= groups) return;
     uint src = args.has_map ? rowmap[row] : row;
     threadgroup int8_t block_values[256];
-    if (tid < args.groupsize) {
-        block_values[tid] = input[src * args.columns + block * args.groupsize
-                                  + tid];
+    if (lane < args.groupsize) {
+        block_values[lane] = input[src * args.columns + block * args.groupsize
+                                   + lane];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid >= args.groupsize) return;
+    if (lane >= args.groupsize) return;
     float acc = 0.0f;
-    device const float *had_row = had + (size_t)tid * args.groupsize;
+    device const float *had_row = had + (size_t)lane * args.groupsize;
     for (uint k = 0; k < args.groupsize; k++) {
         acc += (float)block_values[k] * had_row[k];
     }
-    output[row * args.columns + block * args.groupsize + tid] =
+    output[row * args.columns + block * args.groupsize + lane] =
         h3_f32_to_bf16(acc * scales[src] * args.invsqrt);
 }
 
