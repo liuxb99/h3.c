@@ -138,6 +138,31 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
             return tensor;
         }
     }
+    /* Comfy-Org single-file checkpoints drop the language-model prefix
+       and nest the visual tower one level less: try those spellings as
+       aliases so the directory layout and the single-file layout share
+       one consumer code path. */
+    char alias[256];
+    static const struct { const char *from, *to; } aliases[] = {
+        { "model.language_model.", "model." },
+        { "model.visual.", "visual." },
+        { "model.", "model.language_model." },
+        { "visual.", "model.visual." },
+    };
+    for (size_t a = 0; a < sizeof(aliases) / sizeof(aliases[0]); a++) {
+        size_t flen = strlen(aliases[a].from);
+        if (strncmp(name, aliases[a].from, flen)) continue;
+        if (snprintf(alias, sizeof(alias), "%s%s", aliases[a].to, name + flen)
+                >= (int)sizeof(alias)) break;
+        for (size_t index = 0; index < store->count; index++) {
+            const h3_st_tensor *tensor = h3_st_find(&store->headers[index], alias);
+            if (tensor) {
+                if (header) *header = &store->headers[index];
+                return tensor;
+            }
+        }
+        break;
+    }
     return NULL;
 }
 

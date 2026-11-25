@@ -12,6 +12,7 @@
 #include "h3_video_vae.h"
 #include "h3_vision_encoder.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
@@ -404,6 +405,53 @@ static int h3_inventory(h3_ctx *ctx, const char *relative,
     return ok;
 }
 
+/* Two checkpoint layouts are supported:
+   (a) the original Hugging Face split layout under FL2VA/ and Ref2VA/, and
+   (b) the Comfy-Org single-file layout, where the model directory root holds
+       quantized checkpoint files named minimax_h3_*convrot*.safetensors and
+       *_nvfp4*.safetensors.  Auxiliary components (tokenizer, VAEs) live in
+       the FL2VA/ subtree in either layout. */
+static int h3_detect_single_file_layout(
+        const char *model_dir, char *dit_name, size_t dit_capacity,
+        int *has_te, int *ok_out, char *error, size_t error_size) {
+    DIR *dir = opendir(model_dir);
+    *has_te = 0;
+    dit_name[0] = '\0';
+    if (!dir) {
+        *ok_out = 1;
+        return -1;
+    }
+    int has_dit = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        size_t name_length = strlen(entry->d_name);
+        if (name_length < 14 ||
+            strcmp(entry->d_name + name_length - 13, ".safetensors"))
+            continue;
+        if (strstr(entry->d_name, "int8_convrot") ||
+            strstr(entry->d_name, "convrot")) {
+            snprintf(dit_name, dit_capacity, "%s", entry->d_name);
+            has_dit = 1;
+        } else if (strstr(entry->d_name, "nvfp4")) {
+            *has_te = 1;
+        }
+    }
+    closedir(dir);
+    if (!has_dit) {
+        *ok_out = 1;
+        return 0;
+    }
+    if (!*has_te) {
+        *ok_out = 0;
+        snprintf(error, error_size,
+                 "single-file layout detected (%s) but no nvfp4 text-encoder "
+                 "file is present", dit_name);
+        return 1;
+    }
+    *ok_out = 1;
+    return 1;
+}
+
 h3_ctx *h3_load_dir(const char *model_dir) {
     h3_global_error[0] = '\0';
     if (!model_dir || !*model_dir) {
@@ -421,11 +469,47 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         free(ctx);
         return NULL;
     }
-    if (!h3_require_file(ctx, "FL2VA/transformer/config.json") ||
-        !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
-        !h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder) ||
-        !h3_inventory(ctx, "FL2VA/transformer", &ctx->model.fl2va_transformer) ||
-        !h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
+    char dit_file[256];
+    int has_te = 0, layout_ok = 0, layout_mode;
+    layout_mode = h3_detect_single_file_layout(
+        ctx->model_dir, dit_file, sizeof(dit_file), &has_te,
+        &layout_ok, ctx->error, sizeof(ctx->error));
+    if (!layout_ok) {
+        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        h3_free(ctx);
+        return NULL;
+    }
+    if (layout_mode == 1) {
+        char aux[256];
+        int aux_ok = snprintf(aux, sizeof(aux),
+                              "%s/FL2VA/tokenizer/tokenizer.json",
+                              ctx->model_dir) < (int)sizeof(aux) &&
+                   h3_is_file(aux);
+        if (!aux_ok) {
+            h3_set_error(ctx,
+                         "single-file layout requires FL2VA/tokenizer/"
+                         "tokenizer.json (auxiliary components)");
+            snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+            h3_free(ctx);
+            return NULL;
+        }
+        if (!h3_inventory(ctx, ".", &ctx->model.fl2va_transformer) ||
+            !h3_inventory(ctx, ".", &ctx->model.text_encoder)) {
+            snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+            h3_free(ctx);
+            return NULL;
+        }
+    } else {
+        if (!h3_require_file(ctx, "FL2VA/transformer/config.json") ||
+            !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
+            !h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder) ||
+            !h3_inventory(ctx, "FL2VA/transformer", &ctx->model.fl2va_transformer)) {
+            snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+            h3_free(ctx);
+            return NULL;
+        }
+    }
+    if (!h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
         !h3_inventory(ctx, "FL2VA/audio_vae", &ctx->model.audio_vae)) {
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
         h3_free(ctx);
