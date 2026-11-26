@@ -1055,6 +1055,7 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
 }
 
 static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
+                             const char *tag,
                              h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
                              h3_gpu_tensor *qkv, h3_gpu_tensor *query,
                              h3_gpu_tensor *key, h3_gpu_tensor *value,
@@ -1062,25 +1063,37 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              h3_gpu_tensor *fc1, h3_gpu_tensor *activated,
                              char *error, size_t error_size) {
     uint32_t rows = dit->text_rows;
+    int subtap = dit->dump_active && getenv("H3_REFINE_SUBTAP") != NULL;
+#define SUBTAP(t, nm) do {                                                      \
+    if (subtap) { char dn[64];                                                  \
+        snprintf(dn, sizeof dn, "%s_%s", tag, nm);                              \
+        refine_dump(dit, (t), dn); }                                            \
+} while (0)
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
     OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm1, rows,
                              HIDDEN, 1e-5f), "refiner attention norm");
+    SUBTAP(norm, "norm1");
     OP(h3_gpu_linear_bf16(dit->gpu, qkv, norm, weight->qkv, NULL, rows,
                            HIDDEN, INNER * 3), "refiner QKV");
+    SUBTAP(qkv, "qkv");
     OP(h3_gpu_grouped_qkv_rope_bf16(
                              dit->gpu, query, key, value, qkv, weight->q_norm,
                              weight->k_norm, weight->q_norm, weight->q_norm,
                              rows, HEADS, HEAD_DIM, 0, 1e-5f),
        "refiner QK norm");
+    SUBTAP(query, "q"); SUBTAP(key, "k"); SUBTAP(value, "v");
     OP(h3_gpu_sdpa_bf16(dit->gpu, heads, query, key, value, rows, HEADS,
                          HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
        "refiner attention");
+    SUBTAP(heads, "sdpa");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, heads, weight->out, NULL, rows,
                            INNER, HIDDEN), "refiner attention output");
+    SUBTAP(branch, "outproj");
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner attention residual");
+    SUBTAP(hidden, "resid");
     OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm2, rows,
                              HIDDEN, 1e-5f), "refiner MLP norm");
     OP(h3_gpu_linear_bf16(dit->gpu, fc1, norm, weight->fc1, NULL, rows,
@@ -1175,11 +1188,11 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
     if (ok && getenv("H3_COND_DEBUG"))
         cond_debug(dit, source, condition_w, condition_b, dit->refined_text,
                    "post_cond");
-    ok = ok && run_refiner_block(dit, &refiner[0], dit->refined_text, norm, qkv,
+    ok = ok && run_refiner_block(dit, &refiner[0], "rb0", dit->refined_text, norm, qkv,
              query, key, value, heads, branch, fc1, activated,
              error, error_size);
     if (ok) refine_dump(dit, dit->refined_text, "e1_after_refiner0");
-    ok = ok && run_refiner_block(dit, &refiner[1], dit->refined_text, norm, qkv,
+    ok = ok && run_refiner_block(dit, &refiner[1], "rb1", dit->refined_text, norm, qkv,
              query, key, value, heads, branch, fc1, activated,
              error, error_size);
     if (ok) refine_dump(dit, dit->refined_text, "e1_after_refiner1");
