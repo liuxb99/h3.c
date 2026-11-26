@@ -52,3 +52,9 @@ TE/VAE：s3 檔為 **DiT-only**（無 cross_attn/TE/VAE）→ 沿用本地 NVFP4
 - s3 建議 steps/CFG/sigma shift（作者未寫死；預設=原版 H3 配方 20 步 golden；等步數對比矩陣在 Phase 4）。
 - raw vs 正式 = RL LoRA 併入與否（merged）；s3_raw_w4a8 header 需對照（同 quant metadata?）。
 - ComfyUI 需 ≥0.46.x + comfy_kitchen ≥0.2.39 才認 asym_w4a8_int8（本機實路徑已符合 ✓）。
+
+## 下載完成＋全檔驗證（FACT, 2026-11-27 01:37）
+- `/Volumes/SSD2T/models/SulphurAI-Sulphur-3/s3_w4a8.safetensors` 11,433,462,056 B（=10.65 GiB）；curl 單程完成且 SIZE==EXPECT；SHA256=6c496c746d380bc371e5b9ef0c81cbea4f107e8fba1ac3f6b7d821c4e96e9ae0（HF tree API 未提供 lfs sha 可比對，以 size+單程完成+header 全掃代替並記錄本 hash 為來源指紋）。
+- header 全掃：quantization=asym_w4a8_int8 + `_quantization_metadata`(format_version 1.0, 逐層 layers 清單)；1156 tensors（I8 208=INT4 packed、U8 208=fp8e4m3 s_rel、F32 426、F16 102、BF16 212）；208 量化層四件套齊全；非量化=norms/adaln/patch_proj 等（與原版同型）。
+- 實測 sanity：qkv codebook=對稱 16-level Lloyd-Max（±0.9807）；s_channel 0.0007–0.007 無零行；s_rel fp8 值域 22–128；weight I8 [21504, 2688]（5376 packed ÷2 ✓）。
+- 下載備註：HF CDN 對該檔 HTTP/2 傳輸兩度 CANCEL(err 92)，HTTP/1.1 單程成功——後續大檔下載預設 --http1.1。
