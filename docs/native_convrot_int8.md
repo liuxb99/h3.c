@@ -14,8 +14,13 @@ The MiniMax-H3-comfy-int8 checkpoint stores attention `out_proj` and MLP
 * quant_info: `group_size=256`, `rotation=int8_convrot_orthogonal`
 
 Semantics (proven by dequant corr=1.0000, `tools/probe_convrot_int8.py`):
-the stored row is `w_rot = w_true · H/√G` with H the 256-wide Sylvester
-Hadamard matrix over column groups.  An activation row `a` satisfies
+the stored row is `w_rot = w_true · H/√G` where H is the 256-wide Kronecker
+power `h4⊗4`, `h4[a][b] = -1 iff a XOR b == 3` — the ComfyX convrot_w4a4
+Walsh matrix (`_build_hadamard`), NOT the Sylvester/Walsh-Paley 2^k recursion
+(corrected 2026-11-26: numerically verified that no input permutation makes
+a Sylvester FWLT match the engine's `dit_had()` table; they are different
+orthogonal matrices).  The kernel implements H transposed, which is what
+`a · w_trueᵀ = (a · H/√G) · w_rotᵀ` needs:
 
     a · w_trueᵀ = (a · H/√G) · w_rotᵀ
 
@@ -43,13 +48,19 @@ unrotated; rotating producers is follow-up work.
 
 ## Components
 
-* `h3_shaders.metal: h3_rotate_quantize_bf16_int8_rows` — two-pass
-  FWLT-ordered threadgroup butterfly per 256-column group (Sylvester
-  recursion ⇒ every lane touches every value), 1/√G folded, per-group
-  16-lane absmax reduced across 16 lane-groups, symmetric int8 quantize
-  with `scale = max(absmax, 1e-8)/127`; dead-block lanes are excluded from
-  the row absmax.  Threadgroup = 192 threads (192 chunks = 24 groups of
-  8 float4), so it also serves the fallback 192-chunk quantizer shape.
+* `h3_shaders.metal: h3_rotate_quantize_bf16_int8_rows` — two-pass fused
+  rotation+quantizer per 256-column group.  The transform is applied as
+  four base-4 digit XOR-convolutions (`out[a] = v[a]+v[a^1]+v[a^2]-v[a^3]`
+  per digit — exactly the Kronecker factorization of `h4⊗4`), digit 0
+  in-register on the float4 components, digits 1-2 as `simd_shuffle_xor`
+  pairs, digit 3 across the simdgroup pair via threadgroup memory.  The
+  orthonormal 1/16 fold lands on the stored SCALE (int8 codes are
+  scale-invariant), so `qa · scale_a` reproduces `(H a)/16` bit-for-bit
+  against the CPU oracle.  Per-row clipped-absmax/127 scale semantics
+  match `h3_quantize_bf16_int8_rows`; dead-block lanes are excluded from
+  the row absmax; the wave-loop exchange buffer is parity double-buffered
+  (fast-simdgroup next-wave writes must not clobber slow partners'
+  same-wave reads); padding rows zero only their own output range.
 * `h3_gpu.m` — kernel registered in the pipeline probe list;
   `linear_int8_bf16` layout wrapper routes row-major int8 GEMM inputs
   through `linear_rotq_int8_bf16` when the input's column count is a
@@ -64,6 +75,22 @@ unrotated; rotating producers is follow-up work.
 
 ## Validation ladder (each stage vs the accepted baselines)
 
+0. unit (DONE 2026-11-26, `make h3_native_rotquant_tests`):
+   * CPU fp64 oracle replicates the kernel op-for-op; the GPU kernel is
+     bit-exact on 6 shapes (1/7/128x14336/384x512/2048x7168 rows incl.
+     dead-pair wave cols=14336→57-block grid, padding-row path, adversarial
+     inputs: +-ulp alternating rows near 1.0 forcing digit-stage
+     cancellation, zero/denormal rows exercising the 1/16 fold landing on
+     the scale, clip=0.999 tie path) — all bit-exact OK.
+   * pairing identity on synthetic convrot layer vs fp64 oracle:
+     path A (dequant+bf16 requant) rel_rms 0.0024 (budget 0.015),
+     path B (native A8W8) rel_rms 0.0071 (budget 0.05) — PASS;
+     discriminator: engine qa dump vs CPU (Ma)/16 oracle rel_rms 0.0069
+     ⇒ quantizer+scales verified, remaining delta is bf16 GEMM ordering.
+   * oracle-vs-kernel mismatch history that shaped the design: Sylvester
+     FWLT ≠ transpose of `dit_had()` table (no permutation reconciles);
+     missing wave-parity double-buffering flaked one scale row ~4% off at
+     rows=2048 cols=7168 in ~1 of 7 runs (fixed, 4/4 clean after).
 1. numeric: 640×352×13f engine dump with `H3_DUMP_ALL=1`, tap-compare
    against the recorded BF16 engine taps — per-block anchor rel errors
    must stay at dequant-requant level or better (rotation should reduce
