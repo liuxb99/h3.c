@@ -448,6 +448,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_fc1_swiglu_bf16_nax_r128_morton4"];
             [names addObject:@"h3_quantize_bf16_int8_rows"];
             [names addObject:@"h3_quantize_bf16_int8_rows_scalar"];
+            [names addObject:@"h3_rotate_quantize_bf16_int8_rows"];
             [names addObject:
                 @"h3_quantize_bf16_int8_head_major_to_rows_cached"];
             [names addObject:@"h3_quantize_bf16_int8_groups"];
@@ -2855,6 +2856,52 @@ static int h3_gpu_quantize_bf16_int8_rows(
     return 1;
 }
 
+/* Native A8W8 (convrot space): fused Hadamard rotation + per-row dynamic
+ * int8 quantization.  H3_NATIVE_INT8 consumes the checkpoint's rotated int8
+ * weights directly, so activations must be rotated by the same Hadamard the
+ * convrot dequant folds (see h3_rotate_quantize_bf16_int8_rows). */
+static int h3_gpu_quantize_bf16_int8_rotated_rows(
+                        h3_gpu *opaque, h3_gpu_tensor *output,
+                        h3_gpu_tensor *scales,
+                        const h3_gpu_tensor *input, uint32_t rows,
+                        uint32_t dispatch_rows, uint32_t columns,
+                        float clip) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu.tensorOpsEnabled || !rows || dispatch_rows < rows ||
+        columns % 256 ||
+        !h3_gpu_require_bf16(gpu, input, (size_t)rows * columns,
+                             @"rotated int8 linear input") ||
+        !h3_gpu_require_i8(gpu, output,
+                           (size_t)dispatch_rows * columns,
+                           @"rotated int8 quantized output") ||
+        !h3_gpu_require_f32(gpu, scales, dispatch_rows,
+                            @"rotated int8 quantization scales") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_rotate_quantize_bf16_int8_rows");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 192) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch convrot rot-quantizer");
+        return 0;
+    }
+    int8_quant_args args = {rows, columns, clip};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake(dispatch_rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(192, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 static int h3_gpu_quantize_bf16_int8_head_major_rows(
                         h3_gpu *opaque, h3_gpu_tensor *output,
                         h3_gpu_tensor *scales,
@@ -3107,6 +3154,13 @@ static int h3_gpu_linear_int8_bf16_layout(
             !h3_gpu_quantize_bf16_int8_head_major_rows(
                 opaque, quantized_input, input_scales, input, rows,
                 padded_rows, heads, headDim)) return 0;
+    } else if (getenv("H3_NATIVE_INT8") && input_dim % 256 == 0) {
+        /* Native convrot space: the paired weight tensors must be the raw
+           checkpoint int8 (rotated) + scales — h3_dit.c selects those under
+           the same H3_NATIVE_INT8 gate. */
+        if (!h3_gpu_quantize_bf16_int8_rotated_rows(
+                opaque, quantized_input, input_scales, input, rows,
+                padded_rows, input_dim, 1.0f)) return 0;
     } else if (!h3_gpu_quantize_bf16_int8_rows(
                    opaque, quantized_input, input_scales, input, rows,
                    padded_rows, input_dim, 1.0f,

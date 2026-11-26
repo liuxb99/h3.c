@@ -97,6 +97,13 @@ struct h3_dit {
     int use_slower_unfused_int8_inputs;
     int use_slower_unfused_qkv_rope;
     int use_slower_scalar_qkv_rms;
+    /* Native convrot space (H3_NATIVE_INT8): attention out-proj and FC2
+     * consume the checkpoint's rotated int8 payloads plus per-row F32
+     * scales directly (no BF16 materialization for them), with activations
+     * rotated and quantized by h3_rotate_quantize_bf16_int8_rows.  QKV,
+     * FC1 and attention stay dequantized BF16 until fused rotated
+     * producers land. */
+    int native_int8;
     int use_slower_uncached_int8_scales;
     int use_slower_dynamic_fc1_k;
     int use_slower_grouped_quantizer;
@@ -699,6 +706,65 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
     uint32_t local = full_row - dit->video_target_start;
     return dit->video_target_start + (local / spatial_width) * reduced_width +
            (local % spatial_width) / 2;
+}
+
+/* Native convrot space: load the checkpoint's rotated int8 payload and its
+ * per-row F32 scale straight into engine tensors — no dequantization step.
+ * Shapes are the same engine dimensions bf2() would request; the loaders
+ * validate them against the file.  Requires comfy_quant convrot semantics
+ * with group 256, matching h3_rotate_quantize_bf16_int8_rows. */
+static int load_native_int8_pair(h3_dit *dit, h3_gpu_tensor **weight_out,
+                                 h3_gpu_tensor **scale_out, const char *name,
+                                 uint64_t rows, uint64_t columns,
+                                 char *error, size_t error_size) {
+    char detail[512];
+    char scale_name[1024];
+    uint32_t groupsize = 0;
+    int convrot = 0;
+    uint64_t weight_shape[] = {rows, columns};
+    uint64_t scale_shape[] = {rows, 1};
+    if (!h3_weight_quant_info(dit->weights, name, &groupsize, &convrot,
+                              detail, sizeof detail) || !convrot ||
+        groupsize != 256) {
+        fail(error, error_size,
+             "%s is not convrot group-256 int8 (native mode): %s", name,
+             detail);
+        return 0;
+    }
+    if (strlen(name) > 7 && !strcmp(name + strlen(name) - 7, ".weight"))
+        snprintf(scale_name, sizeof scale_name, "%.*s.weight_scale",
+                 (int)(strlen(name) - 7), name);
+    else
+        snprintf(scale_name, sizeof scale_name, "%s.weight_scale", name);
+    *weight_out = h3_weight_load_i8(dit->weights, dit->gpu, name, 2,
+                                    weight_shape, detail, sizeof detail);
+    if (!*weight_out) {
+        fail(error, error_size, "%s: %s", name, detail);
+        return 0;
+    }
+    *scale_out = h3_weight_load_f32(dit->weights, dit->gpu, scale_name, 2,
+                                    scale_shape, detail, sizeof detail);
+    if (!*scale_out) {
+        free_tensor(weight_out);
+        fail(error, error_size, "%s: %s", scale_name, detail);
+        return 0;
+    }
+    return 1;
+}
+
+static int load_native_int8(h3_dit *dit, h3_dit_block *block,
+                            const char *prefix, char *error,
+                            size_t error_size) {
+    char name[160];
+    snprintf(name, sizeof name, "%sattn.out_proj.weight", prefix);
+    if (!load_native_int8_pair(dit, &block->out_int8, &block->out_scales,
+                               name, HIDDEN, INNER, error, error_size))
+        return 0;
+    snprintf(name, sizeof name, "%smlp.fc2.weight", prefix);
+    if (!load_native_int8_pair(dit, &block->fc2_int8, &block->fc2_scales,
+                               name, HIDDEN, FFN, error, error_size))
+        return 0;
+    return 1;
 }
 
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
@@ -1472,13 +1538,16 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
-            if (dit->int8_mlp &&
+            if (dit->native_int8 &&
+                !load_native_int8(dit, &dit->blocks[index], prefix,
+                                  error, error_size)) return 0;
+            if (!dit->native_int8 && dit->int8_mlp &&
                 !quantize_block_mlp(dit, &dit->blocks[index],
                                     error, error_size)) return 0;
-            if (dit->int8_qkv &&
+            if (!dit->native_int8 && dit->int8_qkv &&
                 !quantize_block_qkv(dit, &dit->blocks[index],
                                     error, error_size)) return 0;
-            if (dit->int8_attention_out &&
+            if (!dit->native_int8 && dit->int8_attention_out &&
                 !quantize_block_attention_out(
                     dit, &dit->blocks[index], error, error_size)) return 0;
         }
@@ -1846,10 +1915,12 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
-    dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
+    dit->native_int8 = !dit->ssd_streaming && getenv("H3_NATIVE_INT8") != NULL;
+    dit->int8_mlp = !dit->ssd_streaming && !dit->native_int8 && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
+    dit->int8_qkv = !dit->ssd_streaming && !dit->native_int8 &&
+                    !use_slower_bf16_qkv &&
                     dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
     dit->int8_attention_out = !dit->ssd_streaming &&
@@ -2428,7 +2499,21 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
-    if (dit->int8_mlp &&
+    if (dit->native_int8 && weight->fc2_int8) {
+        /* Native convrot space: FC1 stays BF16; its SwiGLU output is
+         * rotated and quantized by the linear_int8 layout wrapper, and the
+         * file's rotated FC2 int8 consumes it in the same Hadamard basis. */
+        OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
+            NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
+        OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
+           "DiT SwiGLU");
+        OP(h3_gpu_linear_int8_bf16(
+            dit->gpu, mlp_output, dit->int8_activation,
+            dit->int8_activation_scales, dit->activated,
+            weight->fc2_int8, weight->fc2_scales, rows, FFN, HIDDEN,
+            dit->use_slower_uncached_int8_scales),
+           "DiT native convrot int8 FC2");
+    } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
         OP(h3_gpu_mlp_int8_bf16(
