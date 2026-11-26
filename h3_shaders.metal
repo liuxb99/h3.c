@@ -1424,8 +1424,8 @@ kernel void h3_rotate_quantize_bf16_int8_rows(
     uint nblocks = args.columns / 256;
     uint waves = (nblocks + 2) / 3;
     uint pair = simdgroup >> 1;          /* 0..2: which block of the wave */
-    uint half = simdgroup & 1;           /* 0: s=lane, 1: s=lane+32 */
-    uint slot = half * 32 + lane;        /* vector index inside the block */
+    uint lane_half = simdgroup & 1;      /* 0: s=lane, 1: s=lane+32 */
+    uint slot = lane_half * 32 + lane;   /* vector index inside the block */
     float local_max = 0.0f;
     for (uint wave = 0; wave < waves; wave++) {
         uint block = 3 * wave + pair;
@@ -1446,10 +1446,10 @@ kernel void h3_rotate_quantize_bf16_int8_rows(
                      : float4(v.x + o.x, v.y + o.y, v.z + o.z, v.w + o.w);
         }
         /* FWLT stage 8: vector bit 5 crosses the simdgroup pair */
-        if (live)        exchange[half][pair][lane] = v;
+        if (live)        exchange[lane_half][pair][lane] = v;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float4 partner = exchange[1 - half][pair][lane];
-        v = half ? v - partner : v + partner;
+        float4 partner = exchange[1 - lane_half][pair][lane];
+        v = lane_half ? v - partner : v + partner;
         if (!live) continue;  /* dead-block lanes hold stale exchange data:
                                * keep them out of the row absmax */
         v *= 0.0625f;  /* 1/sqrt(256): the convrot tables fold an orthonormal
@@ -1483,10 +1483,10 @@ kernel void h3_rotate_quantize_bf16_int8_rows(
             v = high ? float4(o.x - v.x, o.y - v.y, o.z - v.z, o.w - v.w)
                      : float4(v.x + o.x, v.y + o.y, v.z + o.z, v.w + o.w);
         }
-        exchange[half][pair][lane] = v;
+        exchange[lane_half][pair][lane] = v;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float4 partner = exchange[1 - half][pair][lane];
-        v = half ? v - partner : v + partner;
+        float4 partner = exchange[1 - lane_half][pair][lane];
+        v = lane_half ? v - partner : v + partner;
         v *= 0.0625f;  /* orthonormal H, see pass 1 */
         int4 quantized = int4(rint(v * inverse));
         output4[base / 4 + block * 64 + slot] =

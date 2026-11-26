@@ -48,5 +48,12 @@ h3_gpu_tensor *h3_weight_load_u8(const h3_weight_store *store, h3_gpu *gpu,
                                  const char *name, int ndim,
                                  const uint64_t *shape,
                                  char *error, size_t error_size);
+/* 2D strict-BF16 consumer entry point that also accepts convrot/int8
+   quantized payloads: materializes BF16 via the verified convrot
+   dequant when the checkpoint quantized the tensor. */
+h3_gpu_tensor *h3_weight_load_bf16_auto(const h3_weight_store *store,
+                                        h3_gpu *gpu, const char *name,
+                                        uint64_t rows, uint64_t columns,
+                                        char *error, size_t error_size);
 
 #endif

@@ -1760,10 +1760,11 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
-    if (!dit->fused_mlp) {
+    if (!dit->fused_mlp || dit->native_int8) {
         dit->fc1 = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN * 2);
     }
-    if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp) {
+    if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp ||
+        dit->native_int8) {
         dit->activated = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN);
         if ((!dit->fused_mlp && !dit->fc1) || !dit->activated) {
             fail(error, error_size,
@@ -1772,7 +1773,8 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
-    if (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) {
+    if (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out ||
+        dit->native_int8) {
         size_t padded_sequence = (sequence + 127) & ~(size_t)127;
         dit->int8_activation = h3_gpu_tensor_new_i8(
             dit->gpu, padded_sequence * FFN);

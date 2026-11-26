@@ -354,3 +354,130 @@ h3_gpu_tensor *h3_weight_load_u8(const h3_weight_store *store, h3_gpu *gpu,
     return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_U8,
                        error, error_size);
 }
+
+/* Build the transposed Hadamard used by the convrot dequant kernel:
+   out[j * groupsize + k] = H[k][j], with H built by iterative
+   Walsh-Paley (Sylvester) expansion from the 4x4 core.  Identical
+   construction to the per-block path in h3_dit.c. */
+static float *hadamard_transposed(uint32_t groupsize) {
+    static const float h4[4][4] = {
+        {1.0f, 1.0f, 1.0f, -1.0f}, {1.0f, 1.0f, -1.0f, 1.0f},
+        {1.0f, -1.0f, 1.0f, 1.0f}, {-1.0f, 1.0f, 1.0f, 1.0f}};
+    size_t width = 1;
+    float *had = malloc((size_t)groupsize * groupsize * sizeof(*had));
+    if (!had) return NULL;
+    had[0] = 1.0f;
+    while (width < groupsize) {
+        float *grown = malloc(width * width * 16 * sizeof(*grown));
+        if (!grown) { free(had); return NULL; }
+        for (size_t i = 0; i < width; i++)
+            for (size_t j = 0; j < width; j++)
+                for (int k = 0; k < 4; k++)
+                    for (int l = 0; l < 4; l++)
+                        grown[(i * 4 + k) * width * 4 + j * 4 + l] =
+                            had[i * width + j] * h4[k][l];
+        free(had);
+        had = grown;
+        width *= 4;
+    }
+    for (size_t j = 0; j < groupsize; j++)
+        for (size_t k = j + 1; k < groupsize; k++) {
+            float hold = had[j * groupsize + k];
+            had[j * groupsize + k] = had[k * groupsize + j];
+            had[k * groupsize + j] = hold;
+        }
+    return had;
+}
+
+h3_gpu_tensor *h3_weight_load_bf16_auto(const h3_weight_store *store,
+                                        h3_gpu *gpu, const char *name,
+                                        uint64_t rows, uint64_t columns,
+                                        char *error, size_t error_size) {
+    /* 2D weight that the checkpoint may store either as BF16 or as
+       group-quantized int8 (convrot sidecar).  Strict-BF16 consumers
+       (AdaLN schedule) use this so a convrot-int8 checkpoint loads
+       without a separate materialization pass; unquantized tensors
+       take the original strict path untouched. */
+    if (error && error_size) error[0] = '\0';
+    if (!h3_weight_is_quantized(store, name))
+        { uint64_t shape[] = {rows, columns};
+          return h3_weight_load_bf16(store, gpu, name, 2, shape, error,
+                                     error_size); }
+    uint32_t groupsize = 0;
+    int convrot = 0;
+    if (!h3_weight_quant_info(store, name, &groupsize, &convrot, error,
+                              error_size))
+        return NULL;
+    char scale_name[1024];
+    if (strlen(name) > 7 && !strcmp(name + strlen(name) - 7, ".weight"))
+        snprintf(scale_name, sizeof scale_name, "%.*s.weight_scale",
+                 (int)(strlen(name) - 7), name);
+    else
+        snprintf(scale_name, sizeof scale_name, "%s.weight_scale", name);
+    uint64_t weight_shape[] = {rows, columns};
+    uint64_t scale_shape[] = {rows, 1};
+    h3_gpu_tensor *weight = h3_weight_load_i8(store, gpu, name, 2,
+                                              weight_shape, error,
+                                              error_size);
+    if (!weight) return NULL;
+    h3_gpu_tensor *scale = h3_weight_load_f32(store, gpu, scale_name, 2,
+                                              scale_shape, error,
+                                              error_size);
+    if (!scale) { h3_gpu_tensor_free(weight); return NULL; }
+    h3_gpu_tensor *had = NULL, *out = NULL;
+    if (convrot) {
+        if (groupsize < 4 || (groupsize & (groupsize - 1)) ||
+            (groupsize & 3) || columns % groupsize) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "%s: convrot group %u incompatible with %llu columns",
+                         name, groupsize, (unsigned long long)columns);
+            goto failed;
+        }
+        float *had_cpu = hadamard_transposed(groupsize);
+        if (!had_cpu) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "out of memory building Hadamard %u", groupsize);
+            goto failed;
+        }
+        had = h3_gpu_tensor_from_f32(gpu, had_cpu,
+                                     (size_t)groupsize * groupsize);
+        free(had_cpu);
+        if (!had) {
+            if (error && error_size)
+                snprintf(error, error_size, "cannot upload Hadamard %u: %s",
+                         groupsize, h3_gpu_error(gpu));
+            goto failed;
+        }
+    }
+    out = h3_gpu_tensor_new_bf16(gpu, (size_t)rows * columns);
+    if (!out) {
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory materializing %s",
+                     name);
+        goto failed;
+    }
+    int ok = convrot
+        ? h3_gpu_dequant_convrot(gpu, out, weight, scale, had, NULL,
+                                 (uint32_t)rows, (uint32_t)columns,
+                                 groupsize)
+        : h3_gpu_dequant_int8_rows(gpu, out, weight, scale, (uint32_t)rows,
+                                   (uint32_t)columns);
+    if (!ok) {
+        if (error && error_size)
+            snprintf(error, error_size, "%s dequant: %s", name,
+                     h3_gpu_error(gpu));
+        goto failed;
+    }
+    h3_gpu_tensor_free(scale);
+    h3_gpu_tensor_free(weight);
+    if (had) h3_gpu_tensor_free(had);
+    return out;
+failed:
+    if (out) h3_gpu_tensor_free(out);
+    if (had) h3_gpu_tensor_free(had);
+    h3_gpu_tensor_free(scale);
+    h3_gpu_tensor_free(weight);
+    return NULL;
+}
