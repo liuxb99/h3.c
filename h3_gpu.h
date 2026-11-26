@@ -48,6 +48,8 @@ h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
                                        size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const int8_t *values,
+                                     size_t elements);
 /* Allocate shared Metal storage and pread BF16 payload directly into it. */
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
@@ -77,6 +79,9 @@ int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
+/* Read an int8 tensor (rot-quant dumps, convrot payloads) to host memory. */
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
@@ -334,6 +339,16 @@ int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
                                 uint32_t columns);
+/* Native A8W8 (convrot space): fused Hadamard rotation + per-row dynamic
+ * int8 quantization of a BF16 activation, matching the checkpoint's rotated
+ * weights exactly (see h3_rotate_quantize_bf16_int8_rows).  Exposed for the
+ * FP32 CPU oracle test. */
+int h3_gpu_quantize_bf16_int8_rotated_rows(h3_gpu *gpu, h3_gpu_tensor *output,
+                                           h3_gpu_tensor *scales,
+                                           const h3_gpu_tensor *input,
+                                           uint32_t rows,
+                                           uint32_t dispatch_rows,
+                                           uint32_t columns, float clip);
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,

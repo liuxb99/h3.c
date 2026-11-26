@@ -606,6 +606,11 @@ h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
     return h3_gpu_tensor_new(gpu, values, elements, sizeof(uint32_t), H3_GPU_U32);
 }
 
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const int8_t *values,
+                                     size_t elements) {
+    return h3_gpu_tensor_new(gpu, values, elements, sizeof(int8_t), H3_GPU_I8);
+}
+
 static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
                                               uint64_t file_offset,
                                               size_t elements,
@@ -845,6 +850,14 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
     if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_BF16 ||
         elements > TENSOR(tensor).elements) return 0;
     memcpy(values, TENSOR(tensor).buffer.contents, elements * sizeof(uint16_t));
+    return 1;
+}
+
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements) {
+    if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_I8 ||
+        elements > TENSOR(tensor).elements) return 0;
+    memcpy(values, TENSOR(tensor).buffer.contents, elements);
     return 1;
 }
 
@@ -2860,7 +2873,7 @@ static int h3_gpu_quantize_bf16_int8_rows(
  * int8 quantization.  H3_NATIVE_INT8 consumes the checkpoint's rotated int8
  * weights directly, so activations must be rotated by the same Hadamard the
  * convrot dequant folds (see h3_rotate_quantize_bf16_int8_rows). */
-static int h3_gpu_quantize_bf16_int8_rotated_rows(
+int h3_gpu_quantize_bf16_int8_rotated_rows(
                         h3_gpu *opaque, h3_gpu_tensor *output,
                         h3_gpu_tensor *scales,
                         const h3_gpu_tensor *input, uint32_t rows,

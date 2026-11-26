@@ -33,6 +33,9 @@ h3_tests: tests/test_h3.o $(LIB_OBJ)
 h3_metal_tests: tests/test_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_native_rotquant_tests: tests/test_native_rotquant.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_bf16_tests: tests/test_bf16.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

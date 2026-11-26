@@ -1385,20 +1385,30 @@ kernel void h3_dequant_convrot_rows(
 /* Native A8W8: fused activation Hadamard rotation + per-row dynamic INT8
  * quantization.  The convrot files store rotated weights (W_rot = W @ H_g^T;
  * see h3_dequant_convrot_rows), so the native INT8 GEMM must consume
- * activations rotated by the SAME orthonormal Sylvester H (H = kron^3(H4)
- * over the 8 index bits, entries +-1/sqrt(G)).  Sylvester's identity makes
- * the bit-stage FWLT produce exactly the Kronecker table the dequant kernel
- * multiplies by, so no H matrix traffic is needed at all.
+ * activations rotated by the TRANSPOSE of the exact table dit_had() builds:
+ * H = kron^4(h4), h4[a][b] = -1 iff a XOR b == 3 (the ComfyX convrot_w4a4
+ * Walsh matrix, NOT the Sylvester/Walsh-Paley H2^kron matrix).  Because
+ * h4 is an XOR-convolution matrix (out[a] = v[a]+v[a^1]+v[a^2]-v[a^3]),
+ * each base-4 digit of the 256-group is one independent XOR-convolution
+ * stage, which is exactly what the digit stages below compute, so no H
+ * matrix traffic is needed.  A plain Sylvester FWLT is a DIFFERENT
+ * orthogonal matrix; feeding it permuted inputs does not reconcile them
+ * (verified numerically: no input permutation makes FWLT match the table).
  * Threadgroup = one row x 192 threads: 6 simdgroups process 256-element
  * convrot blocks in pairs (2 simdgroups per block, 3 blocks per wave).
- * Each lane owns 4 contiguous elements; FWLT stages run as: 2 in-thread
- * float4 butterflies (element bits 0-1), 5 simd_shuffle_xor stages (vector
- * bits 0-4), and one simdgroup-pair exchange for vector bit 5 (lane +-32)
- * through threadgroup memory.  Per-row scale semantics match
- * h3_quantize_bf16_int8_rows exactly (clipped absmax / 127), computed over
- * the ROTATED values.  Second pass reloads and re-rotates (input read 2x,
- * output written 1x, no bf16 staging buffer).  columns must be a multiple
- * of 256 (all four convrot linears qualify). */
+ * Each lane owns 4 contiguous elements; the four digit stages run as:
+ * digit 0 in-register on the float4 components (bits 0-1), digits 1-2 as
+ * simd_shuffle_xor pairs (lane bits 0-1 and 2-3 = element bits 2-5), and
+ * digit 3 (element bits 6-7 = lane bit 4 XOR lane_half) via the
+ * simdgroup-pair exchange through threadgroup memory.  H has +-1 entries;
+ * the orthonormal 1/16 fold is applied to the stored SCALE (codes are
+ * scale-invariant), so qa * scale_a reproduces exactly (H a)/16, matching
+ * the dequantized-weight reference W_eff = (H q)/16 * scale_w.  Per-row
+ * scale semantics otherwise match h3_quantize_bf16_int8_rows exactly
+ * (clipped absmax / 127), computed over the ROTATED values.
+ * Second pass reloads and re-rotates (input read 2x, output written 1x, no
+ * bf16 staging buffer).  columns must be a multiple of 256 (all four
+ * convrot linears qualify). */
 kernel void h3_rotate_quantize_bf16_int8_rows(
                            device const bfloat *input [[buffer(0)]],
                            device int8_t *output [[buffer(1)]],
@@ -1410,14 +1420,23 @@ kernel void h3_rotate_quantize_bf16_int8_rows(
                                [[simdgroup_index_in_threadgroup]],
                            ushort lane [[thread_index_in_simdgroup]]) {
     constexpr uint THREADS = 192;
-    threadgroup float4 exchange[2][3][32];
+    /* Double-buffered across waves (parity indexed): without the parity
+     * slot, a fast simdgroup's next-wave write can clobber a slow
+     * simdgroup's same-wave partner read — the single barrier only
+     * orders write->read, not read->next-write. Measured symptom: one
+     * scale row off ~4% (partial-wave absmax) roughly once per full
+     * suite run at rows=2048 cols=7168. */
+    threadgroup float4 exchange[2][2][3][32];
     threadgroup float reduce[8];
     uint base = row * args.columns;
     if (row >= args.rows) {
+        /* Zero only this padding row: threadgroup execution order is
+         * undefined, zeroing [0, row*cols/4) could clobber live rows. */
         device char4 *output4 = reinterpret_cast<device char4 *>(output);
-        uint vectors = row * (args.columns / 4);
-        for (uint vector = tid; vector < vectors; vector += THREADS)
-            output4[vector] = char4(0);
+        uint vector_base = row * (args.columns / 4);
+        uint vectors = args.columns / 4;
+        for (uint column = tid; column < vectors; column += THREADS)
+            output4[vector_base + column] = char4(0);
         if (tid == 0) scales[row] = 1.0f / 127.0f;
         return;
     }
@@ -1426,6 +1445,17 @@ kernel void h3_rotate_quantize_bf16_int8_rows(
     uint pair = simdgroup >> 1;          /* 0..2: which block of the wave */
     uint lane_half = simdgroup & 1;      /* 0: s=lane, 1: s=lane+32 */
     uint slot = lane_half * 32 + lane;   /* vector index inside the block */
+    /* The checkpoint Hadamard is a kron power of the Walsh matrix h4
+     * with entries -1 iff a XOR b == 3 (ComfyX convrot_w4a4
+     * _build_hadamard).  Per base-4 digit the transform is the XOR
+     * convolution out[a] = v[a] + v[a^1] + v[a^2] - v[a^3], i.e.
+     * out = sum(v) - 2 * reverse4(v) after the partners arrive.  The
+     * four digits of the 256-group are: component bits (inside the
+     * float4), lane bits 0-1, lane bits 2-3 (simd shuffles), and
+     * (lane bit 4, lane_half) which crosses the two simdgroups of a
+     * threadgroup via shared memory.  A plain Sylvester FWLT is a
+     * DIFFERENT orthogonal matrix than this kron power; feeding it
+     * permuted inputs does not fix that (verified numerically). */
     float local_max = 0.0f;
     for (uint wave = 0; wave < waves; wave++) {
         uint block = 3 * wave + pair;
@@ -1434,26 +1464,31 @@ kernel void h3_rotate_quantize_bf16_int8_rows(
             reinterpret_cast<device const bfloat4 *>(input);
         float4 v = live ? float4(input4[base / 4 + block * 64 + slot])
                         : float4(0.0f);
-        /* FWLT stage 1: element bit 0 (pairs within the float4) */
-        v = float4(v.x + v.y, v.x - v.y, v.z + v.w, v.z - v.w);
-        /* FWLT stage 2: element bit 1 */
-        v = float4(v.x + v.z, v.y + v.w, v.x - v.z, v.y - v.w);
-        /* FWLT stages 3-7: vector bits 0-4 stay inside the simdgroup */
-        for (uint bit : {1u, 2u, 4u, 8u, 16u}) {
-            float4 o = simd_shuffle_xor(v, bit);
-            bool high = (lane & bit) != 0;
-            v = high ? float4(o.x - v.x, o.y - v.y, o.z - v.z, o.w - v.w)
-                     : float4(v.x + o.x, v.y + o.y, v.z + o.z, v.w + o.w);
+        /* digit 0: component bits, in-register. */
+        v = float4(v.x + v.y + v.z - v.w, v.x + v.y - v.z + v.w,
+                   v.x - v.y + v.z + v.w, -v.x + v.y + v.z + v.w);
+        /* digits 1-2: lane bit pairs, staying inside the simdgroup. */
+        for (uint bit : {1u, 4u}) {
+            float4 p1 = simd_shuffle_xor(v, bit);
+            float4 p2 = simd_shuffle_xor(v, bit << 1);
+            float4 p3 = simd_shuffle_xor(v, bit | (bit << 1));
+            v = v + p1 + p2 - p3;
         }
-        /* FWLT stage 8: vector bit 5 crosses the simdgroup pair */
-        if (live)        exchange[lane_half][pair][lane] = v;
+        /* digit 3: lane bit 4 XOR lane_half, across the simdgroup pair. */
+        if (live)        exchange[wave & 1][lane_half][pair][lane] = v;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float4 partner = exchange[1 - lane_half][pair][lane];
-        v = lane_half ? v - partner : v + partner;
+        {
+            float4 p1 = simd_shuffle_xor(v, 16);
+            float4 p2 = exchange[wave & 1][1 - lane_half][pair][lane];
+            float4 p3 = exchange[wave & 1][1 - lane_half][pair][lane ^ 16];
+            v = v + p1 + p2 - p3;
+        }
         if (!live) continue;  /* dead-block lanes hold stale exchange data:
                                * keep them out of the row absmax */
-        v *= 0.0625f;  /* 1/sqrt(256): the convrot tables fold an orthonormal
-                        * H, so the rotated activation must carry 1/sqrt(G). */
+        /* No 1/sqrt(G) here: the dequant path normalizes with
+         * args.invsqrt on the OUTPUT side (W_eff = W_rot@H / 16), and the
+         * GEMM pairs raw rotated activations with raw rotated weights, so
+         * the activation side must NOT fold 1/16 or the product drifts 256x. */
         local_max = max(local_max, max(max(fabs(v.x), fabs(v.y)),
                                        max(fabs(v.z), fabs(v.w))));
         /* (quantize happens in the second pass; rotated value is recomputed) */
@@ -1463,7 +1498,12 @@ kernel void h3_rotate_quantize_bf16_int8_rows(
     float clipped_max = max_abs * args.clip;
     float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
     float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
-    if (tid == 0) scales[row] = scale;
+    /* Fold 1/sqrt(G)=1/16 into the stored scale, not the quantized codes:
+     * the dequant reference is W_eff = (H q)/16 * scale_w, and the GEMM
+     * epilogue multiplies qa * scale_a, so qa * scale_a must reproduce
+     * (H a)/16.  Codes are invariant to the fold (power-of-two scaling
+     * cancels inside rint(v * 127 / amax)). */
+    if (tid == 0) scales[row] = scale * 0.0625f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device char4 *output4 = reinterpret_cast<device char4 *>(output);
     for (uint wave = 0; wave < waves; wave++) {
@@ -1475,19 +1515,22 @@ kernel void h3_rotate_quantize_bf16_int8_rows(
         device const bfloat4 *input4 =
             reinterpret_cast<device const bfloat4 *>(input);
         float4 v = float4(input4[base / 4 + block * 64 + slot]);
-        v = float4(v.x + v.y, v.x - v.y, v.z + v.w, v.z - v.w);
-        v = float4(v.x + v.z, v.y + v.w, v.x - v.z, v.y - v.w);
-        for (uint bit : {1u, 2u, 4u, 8u, 16u}) {
-            float4 o = simd_shuffle_xor(v, bit);
-            bool high = (lane & bit) != 0;
-            v = high ? float4(o.x - v.x, o.y - v.y, o.z - v.z, o.w - v.w)
-                     : float4(v.x + o.x, v.y + o.y, v.z + o.z, v.w + o.w);
+        v = float4(v.x + v.y + v.z - v.w, v.x + v.y - v.z + v.w,
+                   v.x - v.y + v.z + v.w, -v.x + v.y + v.z + v.w);
+        for (uint bit : {1u, 4u}) {
+            float4 p1 = simd_shuffle_xor(v, bit);
+            float4 p2 = simd_shuffle_xor(v, bit << 1);
+            float4 p3 = simd_shuffle_xor(v, bit | (bit << 1));
+            v = v + p1 + p2 - p3;
         }
-        exchange[lane_half][pair][lane] = v;
+        exchange[wave & 1][lane_half][pair][lane] = v;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float4 partner = exchange[1 - lane_half][pair][lane];
-        v = lane_half ? v - partner : v + partner;
-        v *= 0.0625f;  /* orthonormal H, see pass 1 */
+        {
+            float4 p1 = simd_shuffle_xor(v, 16);
+            float4 p2 = exchange[wave & 1][1 - lane_half][pair][lane];
+            float4 p3 = exchange[wave & 1][1 - lane_half][pair][lane ^ 16];
+            v = v + p1 + p2 - p3;
+        }
         int4 quantized = int4(rint(v * inverse));
         output4[base / 4 + block * 64 + slot] =
             char4(clamp(quantized, int4(-127), int4(127)));
