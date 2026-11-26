@@ -39,6 +39,9 @@ h3_native_rotquant_tests: tests/test_native_rotquant.o $(LIB_OBJ)
 h3_bf16_tests: tests/test_bf16.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_native_loader_tests: tests/test_native_loader.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_tokenizer_tests: tests/test_tokenizer.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -201,6 +204,11 @@ real-parity: h3_real_prompt_test h3_real_dit_block_test
 
 tests/%.o: tests/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
+
+# Loader-only regression: native int8 sidecar metadata against real model
+# directories.  Engine's own store code, seconds to run, no GPU.
+tests/test_native_loader: tests/test_native_loader.o $(LIB_OBJ)
+	$(CC) $(CFLAGS) -o $@ tests/test_native_loader.o $(LIB_OBJ) $(LDLIBS)
 
 # Vendored from Iris. Keep the main project strict without rewriting this small
 # terminal editor for conversion diagnostics unrelated to H3.

@@ -491,8 +491,210 @@ pairing_cleanup:
     free(predicted);
 }
 
+/* Section 3: native A8W8 GEMM edge sweep (Phase 3 Metal kernel acceptance).
+ * Partial waves / tail masking across rows=1..256 on real matrix shapes,
+ * both paths (dequant+bf16 budget 0.015, native int8 budget 0.05) checked
+ * against an fp64 replay of the convrot contract; hot-fill variants stress
+ * accumulator range; a reversed-rowmap variant covers the qkv interleave
+ * sidecar contract.  Padding behavior itself is covered by the shape
+ * section (dispatch-row scales/codes pinned). */
+static uint16_t bf16_code_near(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    uint32_t rounding = 0x7FFFu + ((bits >> 16) & 1u);
+    return (uint16_t)((bits + rounding) >> 16);
+}
+
+static void test_gemmsweep_one(h3_gpu *gpu, uint32_t rows, uint32_t k_dim,
+                               uint32_t n_out, int hot, int rev_map) {
+    size_t a_n = (size_t)rows * k_dim;
+    size_t q_n = (size_t)n_out * k_dim;
+    uint16_t *host_a = malloc(a_n * sizeof *host_a);
+    int8_t *host_q = malloc(q_n);
+    float *host_sw = malloc(n_out * sizeof *host_sw);
+    float *weff = malloc(q_n * sizeof *weff);
+    double *reference = malloc((size_t)rows * n_out * sizeof *reference);
+    uint32_t *map = rev_map ? malloc(n_out * sizeof *map) : NULL;
+    uint16_t *out_a = malloc((size_t)rows * n_out * sizeof *out_a);
+    uint16_t *out_b = malloc((size_t)rows * n_out * sizeof *out_b);
+    char label[128];
+    uint32_t row, column, group, lane, chunk;
+    if (!host_a || !host_q || !host_sw || !weff || !reference || !out_a ||
+        !out_b || (rev_map && !map)) {
+        fail("gemm sweep allocation failed");
+        return;
+    }
+    /* probe table (exact GPU rotation matrix, columnwise unit probes) */
+    static float had_table[GROUP * GROUP];
+    static int had_ready;
+    if (!had_ready) {
+        float probe_in[GROUP], probe_out[GROUP];
+        for (chunk = 0; chunk < GROUP; chunk++) {
+            for (row = 0; row < GROUP; row++)
+                probe_in[row] = (row == chunk) ? 1.0f : 0.0f;
+            rotate_row_cpu(probe_in, probe_out, GROUP);
+            for (row = 0; row < GROUP; row++)
+                had_table[(size_t)row * GROUP + chunk] = probe_out[row];
+        }
+        had_ready = 1;
+    }
+    for (row = 0; row < rows; row++) {
+        for (column = 0; column < k_dim; column++) {
+            if (hot) {
+                uint64_t r = splitmix64();
+                float v = (float)((int32_t)(r % 4096u) - 2048) * 2.0f;
+                host_a[(size_t)row * k_dim + column] = bf16_code_near(v);
+            } else {
+                rand_bf16_value(&host_a[(size_t)row * k_dim + column]);
+            }
+        }
+    }
+    for (row = 0; row < n_out; row++) {
+        for (column = 0; column < k_dim; column++) {
+            int32_t code = (int32_t)(splitmix64() % 255u) - 127;
+            if (hot && column % GROUP == GROUP / 2) code = 127;
+            host_q[(size_t)row * k_dim + column] = (int8_t)code;
+        }
+        host_sw[row] = bf16_to_f32((uint16_t)(0x3800u + (splitmix64() & 0x7fu)));
+    }
+    for (row = 0; row < n_out; row++)
+        if (map) map[row] = n_out - 1u - row;
+    /* fp64-contract reference weights: weff[j][g*256+k] =
+       sw[map? j] * 1/16 * sum_c q[j][g*256+c] * had[k][c] */
+    for (row = 0; row < n_out; row++) {
+        uint32_t src = map ? map[row] : row;
+        for (group = 0; group < k_dim / GROUP; group++) {
+            const int8_t *qg = &host_q[(size_t)src * k_dim + group * GROUP];
+            double s = (double)host_sw[src] * 0.0625;
+            for (lane = 0; lane < GROUP; lane++) {
+                double acc = 0.0;
+                for (chunk = 0; chunk < GROUP; chunk++)
+                    acc += (double)qg[chunk] *
+                           (double)had_table[(size_t)lane * GROUP + chunk];
+                weff[(size_t)row * k_dim + group * GROUP + lane] =
+                    (float)(acc * s);
+            }
+        }
+    }
+    for (row = 0; row < rows; row++)
+        for (column = 0; column < n_out; column++) {
+            double acc = 0.0;
+            for (chunk = 0; chunk < k_dim; chunk++)
+                acc += (double)bf16_to_f32(host_a[(size_t)row * k_dim + chunk]) *
+                       (double)weff[(size_t)column * k_dim + chunk];
+            reference[(size_t)row * n_out + column] = acc;
+        }
+    h3_gpu_tensor *a = h3_gpu_tensor_from_bf16(gpu, host_a, a_n);
+    h3_gpu_tensor *q = h3_gpu_tensor_from_i8(gpu, host_q, q_n);
+    h3_gpu_tensor *sw = h3_gpu_tensor_from_f32(gpu, host_sw, n_out);
+    h3_gpu_tensor *had = h3_gpu_tensor_from_f32(gpu, had_table, GROUP * GROUP);
+    h3_gpu_tensor *rowmap = map ? h3_gpu_tensor_from_u32(gpu, map, n_out) : NULL;
+    h3_gpu_tensor *w_eff = h3_gpu_tensor_new_bf16(gpu, q_n);
+    h3_gpu_tensor *result_a = h3_gpu_tensor_new_bf16(gpu, (size_t)rows * n_out);
+    h3_gpu_tensor *result_b = h3_gpu_tensor_new_bf16(gpu, (size_t)rows * n_out);
+    h3_gpu_tensor *qact = h3_gpu_tensor_new_i8(gpu, a_n);
+    h3_gpu_tensor *sact = h3_gpu_tensor_new_f32(gpu, rows);
+    if (!a || !q || !sw || !had || !w_eff || !result_a || !result_b || !qact ||
+        !sact || (rev_map && !rowmap)) {
+        fail("gemm sweep tensor allocation failed");
+        return;
+    }
+    snprintf(label, sizeof label, "rows=%u k=%u n=%u hot=%d revmap=%d", rows,
+             k_dim, n_out, hot, rev_map);
+    if (!h3_gpu_begin(gpu)) fail("sweep begin");
+    if (!h3_gpu_dequant_convrot(gpu, w_eff, q, sw, had, rowmap, n_out, k_dim,
+                                GROUP)) {
+        fprintf(stderr, "FAIL sweep dequant_convrot %s: %s\n", label,
+                h3_gpu_error(gpu));
+        failures++;
+        goto sweep_cleanup;
+    }
+    if (!h3_gpu_linear_bf16(gpu, result_a, a, w_eff, NULL, rows, k_dim,
+                            n_out)) {
+        fprintf(stderr, "FAIL sweep linear_bf16 %s: %s\n", label,
+                h3_gpu_error(gpu));
+        failures++;
+        goto sweep_cleanup;
+    }
+    if (!h3_gpu_submit(gpu)) fail("sweep submit A");
+    if (!h3_gpu_tensor_read_bf16(result_a, out_a, (size_t)rows * n_out))
+        fail("sweep readback A");
+    if (setenv("H3_NATIVE_INT8", "1", 1) != 0) fail("sweep setenv");
+    if (!h3_gpu_begin(gpu)) fail("sweep begin B");
+    if (!h3_gpu_linear_int8_bf16(gpu, result_b, qact, sact, a, q, sw, rows,
+                                 k_dim, n_out, 0)) {
+        fprintf(stderr, "FAIL sweep linear_int8 %s: %s\n", label,
+                h3_gpu_error(gpu));
+        failures++;
+        unsetenv("H3_NATIVE_INT8");
+        goto sweep_cleanup;
+    }
+    unsetenv("H3_NATIVE_INT8");
+    if (!h3_gpu_submit(gpu)) fail("sweep submit B");
+    if (!h3_gpu_tensor_read_bf16(result_b, out_b, (size_t)rows * n_out))
+        fail("sweep readback B");
+    {
+        char msg[192];
+        snprintf(msg, sizeof msg, "%s path A vs fp64", label);
+        double rel_a = compare_against_reference(out_a, reference, rows, n_out,
+                                                 msg);
+        snprintf(msg, sizeof msg, "%s path B native vs fp64", label);
+        double rel_b = compare_against_reference(out_b, reference, rows, n_out,
+                                                 msg);
+        uint32_t nan_b = 0, nan_a = 0;
+        for (row = 0; row < rows; row++)
+            for (column = 0; column < n_out; column++) {
+                if (isnan(bf16_to_f32(out_a[(size_t)row * n_out + column])))
+                    nan_a++;
+                if (isnan(bf16_to_f32(out_b[(size_t)row * n_out + column])))
+                    nan_b++;
+            }
+        if (rel_a > 0.015 || rel_b > 0.05 || nan_a || nan_b) {
+            fprintf(stderr,
+                    "FAIL gemm sweep %s: rel_a=%.6f (budget 0.015) "
+                    "rel_b=%.6f (budget 0.05) nan_a=%u nan_b=%u\n",
+                    label, rel_a, rel_b, nan_a, nan_b);
+            failures++;
+        } else {
+            printf("gemm sweep %s: rel_a=%.6f rel_b=%.6f finite OK\n", label,
+                   rel_a, rel_b);
+        }
+    }
+sweep_cleanup:
+    h3_gpu_tensor_free(a); h3_gpu_tensor_free(q); h3_gpu_tensor_free(sw);
+    h3_gpu_tensor_free(had); h3_gpu_tensor_free(rowmap);
+    h3_gpu_tensor_free(w_eff); h3_gpu_tensor_free(result_a);
+    h3_gpu_tensor_free(result_b); h3_gpu_tensor_free(qact);
+    h3_gpu_tensor_free(sact);
+    free(host_a); free(host_q); free(host_sw); free(weff); free(reference);
+    free(map); free(out_a); free(out_b);
+}
+
+static void test_gemmsweep(h3_gpu *gpu) {
+    static const uint32_t full_rows[] = {1,   2,   4,   8,  13,  20,
+                                          25,  63,  127, 128, 129, 256};
+    static const uint32_t light_rows[] = {1, 129, 256};
+    uint32_t i;
+    for (i = 0; i < sizeof full_rows / sizeof full_rows[0]; i++)
+        test_gemmsweep_one(gpu, full_rows[i], 5120, 3072, 0, 0);
+    for (i = 0; i < sizeof full_rows / sizeof full_rows[0]; i++)
+        test_gemmsweep_one(gpu, full_rows[i], 5376, 5376, 0, 0);
+    for (i = 0; i < sizeof light_rows / sizeof light_rows[0]; i++) {
+        test_gemmsweep_one(gpu, light_rows[i], 7168, 5120, 0, 0);
+        test_gemmsweep_one(gpu, light_rows[i], 5120, 14336, 0, 0);
+        test_gemmsweep_one(gpu, light_rows[i], 14336, 5120, 0, 0);
+    }
+    /* accumulator-range stress (int32 vs fp16 accumulation discriminant) */
+    test_gemmsweep_one(gpu, 129, 14336, 5120, 1, 0);
+    test_gemmsweep_one(gpu, 256, 5120, 14336, 1, 0);
+    test_gemmsweep_one(gpu, 20, 5376, 5376, 1, 0);
+    /* qkv sidecar row-interleave contract */
+    test_gemmsweep_one(gpu, 129, 5120, 3072, 0, 1);
+}
+
 int main(int argc, char **argv) {
     const int pairing_only = argc > 1 && !strcmp(argv[1], "--pairing-only");
+    const int gemm_only = argc > 1 && !strcmp(argv[1], "--gemm-sweep");
     const int shape2048 = argc > 1 && !strcmp(argv[1], "--shape-2048");
     char error[256];
     h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof error);
@@ -508,7 +710,9 @@ int main(int argc, char **argv) {
     /* Bit-exact contract across shapes covering: single wave (1 block),
        dead-pair waves (cols=14336 -> 57 blocks vs 56), padding rows,
        and the production FC2 activation shape 2048x7168. */
-    if (shape2048) {
+    if (gemm_only) {
+        test_gemmsweep(gpu);
+    } else if (shape2048) {
         test_shape(gpu, 2048, 7168, 1.0f);
     } else if (!pairing_only) {
         test_shape(gpu, 1, 256, 1.0f);
@@ -518,7 +722,7 @@ int main(int argc, char **argv) {
         test_shape(gpu, 2048, 7168, 1.0f);
         test_shape(gpu, 384, 512, 0.999f);
     }
-    if (!shape2048)
+    if (!shape2048 && !gemm_only)
         test_pairing(gpu);
     h3_gpu_free(gpu);
     if (failures) {

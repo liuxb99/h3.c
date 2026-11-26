@@ -426,8 +426,11 @@ static int h3_detect_single_file_layout(
     struct dirent *entry;
     while ((entry = readdir(dir))) {
         size_t name_length = strlen(entry->d_name);
-        if (name_length < 14 ||
-            strcmp(entry->d_name + name_length - 13, ".safetensors"))
+        /* ".safetensors" is 12 characters; the old -13 offset compared one
+           extra leading character and therefore never matched anything,
+           silently pinning every directory to layout_mode 0. */
+        if (name_length < 13 ||
+            strcmp(entry->d_name + name_length - 12, ".safetensors"))
             continue;
         if (strstr(entry->d_name, "int8_convrot") ||
             strstr(entry->d_name, "convrot")) {
@@ -472,6 +475,7 @@ h3_ctx *h3_load_dir(const char *model_dir) {
     }
     char dit_file[256];
     int has_te = 0, layout_ok = 0, layout_mode;
+    ctx->dit_weights_relative = "FL2VA/transformer";
     layout_mode = h3_detect_single_file_layout(
         ctx->model_dir, dit_file, sizeof(dit_file), &has_te,
         &layout_ok, ctx->error, sizeof(ctx->error));
@@ -481,6 +485,8 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         return NULL;
     }
     if (layout_mode == 1) {
+        ctx->single_file_layout = 1;
+        ctx->dit_weights_relative = ".";
         char aux[256];
         int aux_ok = snprintf(aux, sizeof(aux),
                               "%s/FL2VA/tokenizer/tokenizer.json",
@@ -1017,7 +1023,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char *text_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/text_encoder" : "FL2VA/text_encoder");
     char *dit_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/transformer" : "FL2VA/transformer");
+        "Ref2VA/transformer" : ctx->dit_weights_relative);
     char *vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
     char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?

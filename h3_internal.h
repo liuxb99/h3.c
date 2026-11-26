@@ -11,6 +11,16 @@ struct h3_video_vae_decoder;
 
 struct h3_ctx {
     char *model_dir;
+    /* Directory (relative to model_dir) that actually holds the FL2VA DiT
+     * weight shards for the detected layout: "FL2VA/transformer" for the
+     * original split layout, "." for the Comfy single-file layout where the
+     * quantized DiT lives at the directory root.  Generation must resolve
+     * the DiT store through this field — a hardcoded "FL2VA/transformer"
+     * silently resolves symlinks to the *original* BF16 checkpoint and
+     * stranded the native convrot path with "lacks sidecar" failures
+     * (2026-11-26 root cause). */
+    const char *dit_weights_relative;
+    int single_file_layout;
     char error[512];
     h3_device_info device;
     h3_model_info model;

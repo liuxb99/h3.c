@@ -5,7 +5,13 @@
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
+#include <sys/statvfs.h>
+
 static const char *h3_dump_dir(void);
+static int h3_dump_selective_mode(void);
+static int h3_dump_quota_suppress(int suppress);
+static int h3_dump_gate_open(const h3_dit *dit);
+static int h3_dump_tap_allowed(const h3_dit *dit, const char *name);
 static void dit_dump_raw(h3_dit *dit, const void *values, size_t bytes,
                          const char *tag, uint32_t rows, uint32_t cols,
                          const char *dtype);
@@ -13,6 +19,12 @@ static void dit_dump_gpu(h3_dit *dit, const h3_gpu_tensor *tensor,
                          const char *tag, uint32_t rows, uint32_t cols);
 static int dit_dump_pause(h3_dit *dit);
 static int dit_dump_resume(h3_dit *dit);
+static void refine_dump(h3_dit *dit, const h3_gpu_tensor *tensor,
+                        const char *tag);
+static void cond_debug(h3_dit *dit, const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight,
+                       const h3_gpu_tensor *bias,
+                       const h3_gpu_tensor *output, const char *phase);
 
 #include <math.h>
 #include <pthread.h>
@@ -726,6 +738,20 @@ static int load_native_int8_pair(h3_dit *dit, h3_gpu_tensor **weight_out,
     if (!h3_weight_quant_info(dit->weights, name, &groupsize, &convrot,
                               detail, sizeof detail) || !convrot ||
         groupsize != 256) {
+        if (getenv("H3_DEBUG_NATIVE")) {
+            fprintf(stderr, "native-debug: store=%p dir=%s name=%s\n",
+                    (void *)dit->weights, getenv("H3_DEBUG_NATIVE_DIR") ?
+                    getenv("H3_DEBUG_NATIVE_DIR") : "?", name);
+            size_t shards = h3_weight_store_shards(dit->weights);
+            for (size_t i = 0; i < shards; i++)
+                fprintf(stderr, "native-debug: shard %zu\n", i);
+            const h3_st_header *hd = NULL;
+            char sc[1024];
+            snprintf(sc, sizeof sc, "%.*s.comfy_quant",
+                     (int)(strlen(name) - 7), name);
+            fprintf(stderr, "native-debug: sidecar=%s found=%d\n", sc,
+                    h3_weight_find(dit->weights, sc, &hd) != NULL);
+        }
         fail(error, error_size,
              "%s is not convrot group-256 int8 (native mode): %s", name,
              detail);
@@ -1111,23 +1137,58 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
                  h3_gpu_error(dit->gpu));
         goto cleanup;
     }
+    if (ok && getenv("H3_COND_DEBUG")) {
+        /* Sentinel experiment: pre-fill the condition-GEMM output with
+         * bf16 0.5 (0x3F00). After the submit-forced completion, any
+         * surviving 0x3F00 element proves the dispatch never wrote. */
+        size_t n = (size_t)dit->text_rows * HIDDEN;
+        uint16_t *sentinel = malloc(n * 2u);
+        if (sentinel) {
+            for (size_t i = 0; i < n; i++) sentinel[i] = 0x3F00u;
+            if (h3_gpu_tensor_write_bf16(dit->refined_text, sentinel, n))
+                fprintf(stderr, "CONDDBG sentinel prefill n=%zu ok\n", n);
+            else
+                fprintf(stderr, "CONDDBG sentinel prefill FAILED: %s\n",
+                        h3_gpu_error(dit->gpu));
+            free(sentinel);
+        }
+    }
+    if (dit->dump_active && text->values) {
+        int dump_suppress = h3_dump_quota_suppress(1);
+        dit_dump_raw(dit, text->values,
+                     (size_t)text->tokens * TEXT_DIM * 2u, "e1_text_source",
+                     (uint32_t)text->tokens, TEXT_DIM, "bf16");
+        (void)h3_dump_quota_suppress(dump_suppress);
+    }
     ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
                 "begin token refinement") &&
          gpu_op(dit, h3_gpu_linear_bf16(
              dit->gpu, dit->refined_text, source, condition_w, condition_b,
              dit->text_rows, TEXT_DIM, HIDDEN), error, error_size,
-             "condition projection") &&
-         run_refiner_block(dit, &refiner[0], dit->refined_text, norm, qkv,
+             "condition projection");
+    if (ok) refine_dump(dit, dit->refined_text, "e1_after_cond");
+    if (ok && dit->dump_active) {
+        refine_dump(dit, source, "e3_source_gpu");
+        refine_dump(dit, condition_w, "e3_condition_w_gpu");
+        refine_dump(dit, condition_b, "e3_condition_b_gpu");
+    }
+    if (ok && getenv("H3_COND_DEBUG"))
+        cond_debug(dit, source, condition_w, condition_b, dit->refined_text,
+                   "post_cond");
+    ok = ok && run_refiner_block(dit, &refiner[0], dit->refined_text, norm, qkv,
              query, key, value, heads, branch, fc1, activated,
-             error, error_size) &&
-         run_refiner_block(dit, &refiner[1], dit->refined_text, norm, qkv,
+             error, error_size);
+    if (ok) refine_dump(dit, dit->refined_text, "e1_after_refiner0");
+    ok = ok && run_refiner_block(dit, &refiner[1], dit->refined_text, norm, qkv,
              query, key, value, heads, branch, fc1, activated,
-             error, error_size) &&
-         gpu_op(dit, h3_gpu_rms_norm_bf16(
+             error, error_size);
+    if (ok) refine_dump(dit, dit->refined_text, "e1_after_refiner1");
+    ok = ok && gpu_op(dit, h3_gpu_rms_norm_bf16(
              dit->gpu, dit->refined_text, dit->refined_text, final_norm,
              dit->text_rows, HIDDEN, 1e-5f), error, error_size,
-             "refiner final norm") &&
-         gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+             "refiner final norm");
+    if (ok) refine_dump(dit, dit->refined_text, "e1_after_finalnorm");
+    ok = ok && gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
                 "submit token refinement");
 cleanup:
     free_tensor(&source);
@@ -1214,6 +1275,7 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
         }
     }
     if (h3_dump_dir() && !dit->dump_done) {
+        int dump_suppress = h3_dump_quota_suppress(1);
         dit->dump_active = 1;
         dit_dump_raw(dit, cosines, count * sizeof(*cosines),
                      "b0_rope_cos_table", (uint32_t)dit->sequence, ROPE_HALF,
@@ -1225,6 +1287,7 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
                      (size_t)dit->sequence * sizeof(*dit->layout.positions),
                      "b0_layout_positions", (uint32_t)dit->sequence, 3,
                      "f64");
+        (void)h3_dump_quota_suppress(dump_suppress);
         dit->dump_active = 0;
     }
     h3_gpu_tensor *cos_f32 = h3_gpu_tensor_from_f32(dit->gpu, cosines, count);
@@ -1982,6 +2045,12 @@ static h3_dit *load_dit(const char *weight_directory,
         }
     }
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
+    if (h3_dump_dir() && !dit->dump_done) {
+        dit->dump_active = 1;
+        dit->dump_all = getenv("H3_DUMP_ALL") != NULL;
+        dit->dump_step = -1;
+        dit->dump_block = 0;
+    }
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);
@@ -2207,10 +2276,260 @@ static const char *h3_dump_dir(void) {
     return cached;
 }
 
+/* Selective dump plumbing (P3-F): with H3_DUMP_TAPS set, taps outside the
+ * comma-separated glob list emit only a manifest statistics row (dtype, shape,
+ * min/max, NaN/Inf, RMS, FNV-1a hash of raw bytes); full tensors land only for
+ * matching taps, gated by H3_DUMP_STEPS / H3_DUMP_BLOCKS. Infrastructure taps
+ * (layout/rope/latents/refine chain) always dump full so a stats-only run
+ * stays comparable against Golden. Byte quota (H3_DUMP_QUOTA_GB, default 30)
+ * and a free-space floor (H3_DUMP_MIN_FREE_GB, default 50) prevent the
+ * 2026-11-26 disk-full cascade: over quota or under floor, full writes degrade
+ * to stats rows with a one-time stderr warning. Golden baselines are never
+ * touched. */
+static long long h3_dump_env_bytes(const char *name, long long fallback) {
+    const char *value = getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = NULL;
+    double parsed = strtod(value, &end);
+    if (end == value || parsed <= 0.0) return fallback;
+    return (long long)(parsed * 1024.0 * 1024.0 * 1024.0);
+}
+
+static int h3_glob_match(const char *pattern, const char *name) {
+    while (*pattern) {
+        if (*pattern == '*') {
+            pattern++;
+            if (!*pattern) return 1;
+            while (*name) {
+                if (h3_glob_match(pattern, name)) return 1;
+                name++;
+            }
+            return 0;
+        }
+        if (*pattern != *name) return 0;
+        pattern++;
+        name++;
+    }
+    return !*name;
+}
+
+static int h3_list_match(const char *patterns, const char *name) {
+    const char *cursor = patterns;
+    while (cursor && *cursor) {
+        const char *comma = strchr(cursor, ',');
+        size_t length = comma ? (size_t)(comma - cursor) : strlen(cursor);
+        char item[256];
+        if (length && length < sizeof(item)) {
+            memcpy(item, cursor, length);
+            item[length] = '\0';
+            if (h3_glob_match(item, name)) return 1;
+        }
+        cursor = comma ? comma + 1 : cursor + strlen(cursor);
+    }
+    return 0;
+}
+
+static unsigned long long h3_fnv1a(const unsigned char *bytes, size_t length) {
+    unsigned long long hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < length; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+struct h3_dump_stats {
+    unsigned long long hash;
+    double minimum, maximum, rms;
+    size_t nan_inf, elements;
+};
+
+static double h3_dump_element(const unsigned char *bytes, size_t index,
+                              const char *dtype) {
+    if (strcmp(dtype, "f32") == 0) {
+        float value;
+        memcpy(&value, bytes + index * 4u, sizeof(value));
+        return (double)value;
+    }
+    if (strcmp(dtype, "bf16") == 0) {
+        unsigned short bits;
+        unsigned int wide;
+        float value;
+        memcpy(&bits, bytes + index * 2u, sizeof(bits));
+        wide = (unsigned int)bits << 16;
+        memcpy(&value, &wide, sizeof(value));
+        return (double)value;
+    }
+    if (strcmp(dtype, "i8") == 0)
+        return (double)(signed char)bytes[index];
+    if (strcmp(dtype, "u32") == 0) {
+        unsigned int value;
+        memcpy(&value, bytes + index * 4u, sizeof(value));
+        return (double)value;
+    }
+    if (strcmp(dtype, "f64") == 0) {
+        double value;
+        memcpy(&value, bytes + index * 8u, sizeof(value));
+        return value;
+    }
+    return 0.0;
+}
+
+static int h3_dump_element_count(const char *dtype) {
+    if (strcmp(dtype, "f32") == 0 || strcmp(dtype, "u32") == 0) return 4;
+    if (strcmp(dtype, "bf16") == 0) return 2;
+    if (strcmp(dtype, "i8") == 0) return 1;
+    if (strcmp(dtype, "f64") == 0) return 8;
+    return 0;
+}
+
+static int h3_dump_stats_of(const unsigned char *bytes, size_t bytes_length,
+                            const char *dtype, struct h3_dump_stats *stats) {
+    int element_size = h3_dump_element_count(dtype);
+    stats->hash = h3_fnv1a(bytes, bytes_length);
+    stats->minimum = stats->maximum = stats->rms = 0.0;
+    stats->nan_inf = stats->elements = 0;
+    if (!element_size) return 0;
+    size_t count = bytes_length / (size_t)element_size;
+    double sum_square = 0.0;
+    int seen = 0;
+    for (size_t i = 0; i < count; i++) {
+        double value = h3_dump_element(bytes, i, dtype);
+        if (!isfinite(value)) { stats->nan_inf++; continue; }
+        if (!seen) { stats->minimum = stats->maximum = value; seen = 1; }
+        if (value < stats->minimum) stats->minimum = value;
+        if (value > stats->maximum) stats->maximum = value;
+        sum_square += value * value;
+    }
+    stats->elements = count - stats->nan_inf;
+    if (stats->elements)
+        stats->rms = sqrt(sum_square / (double)stats->elements);
+    return 1;
+}
+
+struct h3_dump_state {
+    long long quota_bytes, floor_bytes, written_bytes;
+    long long steps[8], step_ranges[8];
+    unsigned step_items;
+    int selective, steps_forced, quota_warned, floor_warned, quota_suppress;
+    const char *taps;
+};
+
+static struct h3_dump_state *h3_dump_state_p(void) {
+    static struct h3_dump_state cached;
+    static int probed;
+    if (!probed) {
+        struct h3_dump_state fresh;
+        probed = 1;
+        memset(&fresh, 0, sizeof(fresh));
+        const char *taps = getenv("H3_DUMP_TAPS");
+        fresh.selective = taps && *taps;
+        fresh.taps = fresh.selective ? taps : NULL;
+        fresh.quota_bytes = h3_dump_env_bytes("H3_DUMP_QUOTA_GB", 30);
+        fresh.floor_bytes = h3_dump_env_bytes("H3_DUMP_MIN_FREE_GB", 50);
+        const char *steps = getenv("H3_DUMP_STEPS");
+        if (steps && *steps) {
+            fresh.steps_forced = 1;
+            const char *cursor = steps;
+            while (cursor && *cursor && fresh.step_items < 8) {
+                char *end = NULL;
+                fresh.steps[fresh.step_items] = strtoll(cursor, &end, 10);
+                if (end == cursor) break;
+                fresh.step_ranges[fresh.step_items] =
+                    fresh.steps[fresh.step_items];
+                cursor = end;
+                if (*cursor == '-') {
+                    fresh.step_ranges[fresh.step_items] =
+                        strtoll(cursor + 1, &end, 10);
+                    cursor = end;
+                }
+                fresh.step_items++;
+                while (*cursor && *cursor != ',') cursor++;
+                cursor++;
+            }
+        }
+        cached = fresh;
+    }
+    return &cached;
+}
+
+static int h3_dump_selective_mode(void) { return h3_dump_state_p()->selective; }
+
+static int h3_dump_quota_suppress(int suppress) {
+    struct h3_dump_state *state = h3_dump_state_p();
+    int previous = state->quota_suppress;
+    state->quota_suppress = suppress;
+    return previous;
+}
+
+static long long h3_dump_free_bytes(const char *dir) {
+    struct statvfs probe;
+    if (statvfs(dir, &probe) != 0) return (long long)1 << 60;
+    return (long long)probe.f_bavail * (long long)probe.f_frsize;
+}
+
+static int h3_dump_blocks_allowed(const h3_dit *dit);
+static int h3_dump_steps_allowed(const h3_dit *dit);
+
+/* Policy for one tap name: 1 = write the complete tensor (quota permitting),
+ * 0 = stats row only. Legacy mode (no H3_DUMP_TAPS) keeps writing everything. */
+static int h3_dump_tap_allowed(const h3_dit *dit, const char *name) {
+    struct h3_dump_state *state = h3_dump_state_p();
+    if (!state->selective) return 1;
+    if (strncmp(name, "e", 1) == 0 || strncmp(name, "step0_", 6) == 0)
+        return 1;
+    if (strncmp(name, "b0_", 3) == 0 && dit->dump_step < 0) return 1;
+    if (strncmp(name, "b0_", 3) != 0 && !h3_dump_steps_allowed(dit))
+        return 0;
+    if (!h3_dump_blocks_allowed(dit)) return 0;
+    return state->taps && h3_list_match(state->taps, name);
+}
+
+static int h3_dump_blocks_allowed(const h3_dit *dit) {
+    const char *blocks = getenv("H3_DUMP_BLOCKS");
+    if (!blocks || !*blocks) return 1;
+    const char *cursor = blocks;
+    while (cursor && *cursor) {
+        char *end = NULL;
+        long long first = strtoll(cursor, &end, 10);
+        if (end == cursor) break;
+        long long last = first;
+        cursor = end;
+        if (*cursor == '-') {
+            last = strtoll(cursor + 1, &end, 10);
+            cursor = end;
+        }
+        if ((long long)dit->dump_block >= first &&
+            (long long)dit->dump_block <= last)
+            return 1;
+        while (*cursor && *cursor != ',') cursor++;
+        cursor++;
+    }
+    return 0;
+}
+
+static int h3_dump_steps_allowed(const h3_dit *dit) {
+    struct h3_dump_state *state = h3_dump_state_p();
+    if (dit->dump_step < 0) return 0;
+    if (!state->steps_forced) return dit->dump_step == 0;
+    for (unsigned i = 0; i < state->step_items; i++)
+        if (dit->dump_step >= state->steps[i] &&
+            dit->dump_step <= state->step_ranges[i])
+            return 1;
+    return 0;
+}
+
+/* Pause gate: in selective mode the drain window opens for any step/block
+ * covered by the filters; each tap then decides full-vs-stats inside
+ * dit_dump_raw. */
+static int h3_dump_gate_open(const h3_dit *dit) {
+    return h3_dump_selective_mode() && h3_dump_steps_allowed(dit) &&
+           h3_dump_blocks_allowed(dit);
+}
+
 static void dit_dump_raw(h3_dit *dit, const void *values, size_t bytes,
                          const char *tag, uint32_t rows, uint32_t cols,
-                         const char *dtype) {
-    if (!dit->dump_active || !values || !bytes) return;
+                         const char *dtype) {    if (!dit->dump_active || !values || !bytes) return;
     const char *name = tag;
     char prefixed[256];
     if (dit->dump_all && dit->dump_step >= 0 && strncmp(tag, "b0_", 3) == 0) {
@@ -2218,22 +2537,75 @@ static void dit_dump_raw(h3_dit *dit, const void *values, size_t bytes,
                  dit->dump_step, tag + 3);
         name = prefixed;
     }
-    char path[1200];
-    snprintf(path, sizeof(path), "%s/%s_%ux%u_%s.raw", h3_dump_dir(), name,
-             rows, cols, dtype);
-    FILE *file = fopen(path, "wb");
-    if (!file) {
-        fprintf(stderr, "h3 dump: cannot write %s\n", path);
-        return;
+    struct h3_dump_state *state = h3_dump_state_p();
+    int infrastructure = !strncmp(name, "e", 1) ||
+        strncmp(name, "step0_", 6) == 0 ||
+        (strncmp(name, "b0_", 3) == 0 && dit->dump_step < 0);
+    int matches = infrastructure || h3_dump_tap_allowed(dit, name);
+    int quota_ok = 1;
+    if (state->selective && !infrastructure && !state->quota_suppress) {
+        if (state->written_bytes + (long long)bytes > state->quota_bytes) {
+            if (!state->quota_warned) {
+                fprintf(stderr,
+                        "h3 dump: quota %lld GiB reached at tap %s; "
+                        "later full tensors fall back to stats rows\n",
+                        (long long)(state->quota_bytes >> 30), name);
+                state->quota_warned = 1;
+            }
+            quota_ok = 0;
+        } else if (h3_dump_free_bytes(h3_dump_dir()) < state->floor_bytes) {
+            if (!state->floor_warned) {
+                fprintf(stderr,
+                        "h3 dump: free space under %lld GiB floor at tap %s; "
+                        "later full tensors fall back to stats rows\n",
+                        (long long)(state->floor_bytes >> 30), name);
+                state->floor_warned = 1;
+            }
+            quota_ok = 0;
+        }
+    } else if (!state->selective &&
+               h3_dump_free_bytes(h3_dump_dir()) < state->floor_bytes) {
+        static int legacy_warned;
+        if (!legacy_warned) {
+            legacy_warned = 1;
+            fprintf(stderr, "h3 dump: free space under floor; legacy full "
+                            "dump continuing\n");
+        }
     }
-    fwrite(values, 1, bytes, file);
-    if (fclose(file) != 0)
-        fprintf(stderr, "h3 dump: write error on %s\n", path);
+    if (matches && quota_ok) {
+        char path[1200];
+        snprintf(path, sizeof(path), "%s/%s_%ux%u_%s.raw", h3_dump_dir(), name,
+                 rows, cols, dtype);
+        FILE *file = fopen(path, "wb");
+        if (!file) {
+            fprintf(stderr, "h3 dump: cannot write %s\n", path);
+        } else {
+            fwrite(values, 1, bytes, file);
+            if (fclose(file) != 0)
+                fprintf(stderr, "h3 dump: write error on %s\n", path);
+            if (state->selective && !infrastructure && !state->quota_suppress)
+                state->written_bytes += (long long)bytes;
+        }
+    }
     char manifest[1024];
     snprintf(manifest, sizeof(manifest), "%s/manifest.tsv", h3_dump_dir());
     FILE *list = fopen(manifest, "a");
     if (list) {
-        fprintf(list, "%s\t%u\t%u\t%s\t%zu\n", name, rows, cols, dtype, bytes);
+        if (!state->selective) {
+            fprintf(list, "%s\t%u\t%u\t%s\t%zu\n", name, rows, cols, dtype,
+                    bytes);
+        } else {
+            struct h3_dump_stats stats;
+            if (h3_dump_stats_of((const unsigned char *)values, bytes, dtype,
+                                 &stats))
+                fprintf(list,
+                        "%s\t%u\t%u\t%s\t%zu\t%llu\t%.9g\t%.9g\t%zu\t%.9g\n",
+                        name, rows, cols, dtype, bytes, stats.hash,
+                        stats.minimum, stats.maximum, stats.nan_inf, stats.rms);
+            else
+                fprintf(list, "%s\t%u\t%u\t%s\t%zu\tstats-unavailable\n",
+                        name, rows, cols, dtype, bytes);
+        }
         fclose(list);
     }
 }
@@ -2265,7 +2637,57 @@ static void dit_dump_gpu(h3_dit *dit, const h3_gpu_tensor *tensor,
     if (rows && cols && rows * cols * elem_bytes != length)
         fprintf(stderr, "h3 dump: shape mismatch for %s (%zu bytes)\n",
                 tag, length);
+    int suppress = h3_dump_quota_suppress(1);
     dit_dump_raw(dit, bytes, length, tag, rows, cols, names[dtype]);
+    (void)h3_dump_quota_suppress(suppress);
+}
+
+static void refine_dump(h3_dit *dit, const h3_gpu_tensor *tensor,
+                        const char *tag) {
+    if (!dit->dump_active || !tensor) return;
+    if (!h3_gpu_submit(dit->gpu)) return;
+    dit_dump_gpu(dit, tensor, tag, (uint32_t)dit->text_rows, HIDDEN);
+    (void)h3_gpu_begin(dit->gpu);
+}
+
+/* H3_COND_DEBUG=1: synchronous NaN audit of the condition-projection GEMM
+ * operands using the engine's own tensor handles (not a raw upload). */
+static void cond_debug(h3_dit *dit, const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight,
+                       const h3_gpu_tensor *bias,
+                       const h3_gpu_tensor *output, const char *phase) {
+    static const char *tags[4] = {"source", "cond_w", "cond_b", "out"};
+    const h3_gpu_tensor *tensors[4] = {input, weight, bias, output};
+    (void)h3_gpu_submit(dit->gpu);
+    for (int i = 0; i < 4; i++) {
+        const h3_gpu_tensor *t = tensors[i];
+        size_t n = t ? h3_gpu_tensor_elements(t) : 0;
+        if (!n) {
+            fprintf(stderr, "CONDDBG phase=%s %s missing\n", phase, tags[i]);
+            continue;
+        }
+        uint16_t *buf = malloc(n * 2u);
+        if (!buf || !h3_gpu_tensor_read_bf16(t, buf, n)) {
+            fprintf(stderr, "CONDDBG phase=%s %s read_fail n=%zu err=%s\n",
+                    phase, tags[i], n, h3_gpu_error(dit->gpu));
+            free(buf);
+            continue;
+        }
+        size_t nan = 0, inf = 0, sentinel = 0; double maxabs = 0;
+        for (size_t j = 0; j < n; j++) {
+            uint32_t u = (uint32_t)buf[j] << 16; float f;
+            memcpy(&f, &u, 4);
+            if (isnan(f)) nan++;
+            else if (isinf(f)) inf++;
+            else { double a = fabs((double)f); if (a > maxabs) maxabs = a; }
+            if (buf[j] == 0x3F00u) sentinel++;
+        }
+        fprintf(stderr, "CONDDBG phase=%s %s n=%zu nan=%zu inf=%zu sentinel=%zu maxabs=%.4g\n",
+                phase, tags[i], n, nan, inf, sentinel, maxabs);
+        fflush(stderr);
+        free(buf);
+    }
+    (void)h3_gpu_begin(dit->gpu);
 }
 
 static int run_block(h3_dit *dit, unsigned index, int step,
@@ -2291,7 +2713,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
 } while (0)
     dit->dump_block = index;
     dit->dump_step = step;
-    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
+    if (dit->dump_active &&
+        (dit->dump_all || (index == 0 && step == 0) || h3_dump_gate_open(dit))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->hidden, "b0_hidden_in", rows, HIDDEN);
             dit_dump_gpu(dit, row_map, "b0_row_map", rows, 1);
@@ -2322,7 +2745,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
+    if (dit->dump_active &&
+        (dit->dump_all || (index == 0 && step == 0) || h3_dump_gate_open(dit))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->mod_attention, "b0_attn_adaln_out",
                          rows, HIDDEN);
@@ -2349,7 +2773,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
-    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
+    if (dit->dump_active &&
+        (dit->dump_all || (index == 0 && step == 0) || h3_dump_gate_open(dit))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->qkv, "b0_qkv_pre_norm", rows, 3u * INNER);
             dit_dump_gpu(dit, dit->query, "b0_q_post_qknorm_rope",
@@ -2391,7 +2816,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
-    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
+    if (dit->dump_active &&
+        (dit->dump_all || (index == 0 && step == 0) || h3_dump_gate_open(dit))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->attention_heads, "b0_attention_out",
                          rows, INNER);
@@ -2454,7 +2880,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
     }
-    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
+    if (dit->dump_active &&
+        (dit->dump_all || (index == 0 && step == 0) || h3_dump_gate_open(dit))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->attention_output, "b0_out_proj_out",
                          dit->ssd_streaming ? rows + 1u : rows, HIDDEN);
@@ -2490,7 +2917,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
            "DiT MLP AdaLN");
     }
-    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
+    if (dit->dump_active &&
+        (dit->dump_all || (index == 0 && step == 0) || h3_dump_gate_open(dit))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->hidden, "b0_post_attn_hidden", rows,
                          HIDDEN);
@@ -2545,7 +2973,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
     }
-    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
+    if (dit->dump_active &&
+        (dit->dump_all || (index == 0 && step == 0) || h3_dump_gate_open(dit))) {
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->fc1, "b0_fc1_out", rows, FFN * 2);
             dit_dump_gpu(dit, dit->activated, "b0_swiglu_out", rows, FFN);
@@ -2585,8 +3014,10 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->hidden, dit->hidden, mlp_output,
             modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
     }
-    if (dit->dump_active && (dit->dump_all || (index == 0 && step == 0))) {
-        dit->dump_done = 1;
+    if (dit->dump_active &&
+        (dit->dump_all || (index == 0 && step == 0) || h3_dump_gate_open(dit))) {
+        if (!h3_dump_selective_mode())
+            dit->dump_done = 1;
         if (dit_dump_pause(dit)) {
             dit_dump_gpu(dit, dit->hidden, "b0_block_out", rows, HIDDEN);
             if (!dit_dump_resume(dit))
@@ -2701,6 +3132,30 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                    "pack audio source");
                 audio_offset += segment_rows;
             }
+        }
+    }
+    if (dit->dump_active && step == 0) {
+        if (dit_dump_pause(dit)) {
+            dit_dump_gpu(dit, dit->refined_text, "e0_refined_text", 0, HIDDEN);
+            dit_dump_gpu(dit, dit->video_input, "e0_video_input", 0,
+                         VIDEO_PATCH);
+            dit_dump_gpu(dit, dit->audio_input, "e0_audio_input", 0,
+                         AUDIO_CHANNELS);
+            dit_dump_gpu(dit, dit->video_patch_w, "e2_video_patch_w", 0,
+                         VIDEO_PATCH);
+            dit_dump_gpu(dit, dit->video_patch_b, "e2_video_patch_b", 1,
+                         HIDDEN);
+            dit_dump_gpu(dit, dit->audio_patch_b, "e2_audio_patch_b", 1,
+                         HIDDEN);
+            dit_dump_gpu(dit, dit->audio_patch_w, "e2_audio_patch_w", 0,
+                         AUDIO_CHANNELS);
+            dit_dump_gpu(dit, dit->video_projected, "e0_video_projected", 0,
+                         HIDDEN);
+            dit_dump_gpu(dit, dit->audio_projected, "e0_audio_projected", 0,
+                         HIDDEN);
+            dit_dump_gpu(dit, dit->hidden, "e0_hidden_packed", dit->sequence,
+                         HIDDEN);
+            (void)dit_dump_resume(dit);
         }
     }
     if (video_offset != dit->video_total_rows ||
@@ -3241,6 +3696,7 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                                       audio_rows, audio_count);
     if (!ok) fail(error, error_size, "cannot pack/write GPU Euler latents");
     if (ok && h3_dump_dir() && !dit->dump_done) {
+        int dump_suppress = h3_dump_quota_suppress(1);
         dit->dump_active = 1;
         dit->dump_all = getenv("H3_DUMP_ALL") != NULL;
         dit->dump_step = -1;
@@ -3250,6 +3706,7 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                          sizeof(*video_rows),
                      "step0_denoise_input_latents",
                      (uint32_t)dit->video_rows, VIDEO_PATCH, "f32");
+        (void)h3_dump_quota_suppress(dump_suppress);
         char meta[1024];
         snprintf(meta, sizeof(meta), "%s/meta.txt", h3_dump_dir());
         FILE *meta_file = fopen(meta, "wb");
