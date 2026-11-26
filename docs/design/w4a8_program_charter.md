@@ -32,6 +32,8 @@
 ## 五、Phase 2：原生 Metal W4A8 推理
 INT4 packed loader、INT8 activation 量化、fused unpack+dequant+GEMM、SIMD group matrix、tiled GEMM、scale 融合、FP32/INT32 累積依契約、attention/QKV/FFN/proj 低記憶體運算、scratch pool、command buffer 安全管理、權重常駐與 buffer reuse。
 三路線：A=BF16 reference；B=W4A8 分塊反量化（正確性參考+fallback）；C=原生融合 W4A8 kernel（主要最佳化方向）。
+> 使用者定調（2026-11-27）：loader 展開為 I8-grid 可作第一階段相容性與正確性基準，但**必須量測展開後實際記憶體占用與二次量化誤差**（codebook→int8 grid 折入的再量化損失要逐層量化並上報）。最終方向=**packed INT4 權重常駐 + Metal kernel 內融合 codebook lookup、group scale、dequant、GEMM** 的低記憶體路線。ConvRot G=128/256 一律參數化，不得寫死模型格式。
+> 回報節點（使用者指定）：先完成原有 Metal8 修復＋Sulphur 3 第一段有效影片，取得實際畫質/速度/記憶體數據後才回報；期間不新增其他研究任務。「一鏡 120 秒」已足够＝Phase 6 第二/三階段挑戰不擴張，≤120s 達標即收。
 數值驗收須覆蓋真實模型主要 tensor shape（零值、極端值、scale、padding、NaN、Inf、累積誤差）；不得用單一小矩陣宣稱整體成功。
 
 ## 六、Phase 3：端到端影片生成（Sulphur 3）
