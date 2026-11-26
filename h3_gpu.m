@@ -625,11 +625,19 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
     int transformer_weight = strstr(path, "/transformer/") != NULL;
     int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
+    /* P3-C root cause (2026-11-26): newBufferWithBytesNoCopy wrapping a
+     * MAP_PRIVATE file mmap does NOT stay coherent between the CPU pointer
+     * view and the GPU-mapped view once the native quant pipeline touches
+     * the tensor (CPU memcpys invisible to GPU; verified via sentinel
+     * prefill, tap-vs-file SHA match, and CPU-recomputed GEMM).  Native
+     * mode must load into RAM copies; explicit H3_ZERO_COPY_WEIGHTS=1/
+     * transformer still opts in. */
+    int native_int8 = getenv("H3_NATIVE_INT8") != NULL;
     int map_weight = bytes &&
         ((zero_copy && !strcmp(zero_copy, "1")) ||
          (transformer_weight &&
           ((zero_copy && !strcmp(zero_copy, "transformer")) ||
-           (!zero_copy && m5))));
+           (!zero_copy && m5 && !native_int8))));
     if (map_weight) {
         int descriptor = open(path, O_RDONLY | O_CLOEXEC);
         if (descriptor < 0) {
@@ -919,7 +927,17 @@ int h3_gpu_continue(h3_gpu *opaque) {
         gpu.mpsCommand = nil;
         double commit_time = h3_gpu_now();
         [command commit];
+        if (getenv("H3_STAGE_SYNC")) [command waitUntilCompleted];
         [gpu.inflightCommands addObject:command];
+        if (getenv("H3_COND_DEBUG")) {
+            static int cbseq = 0;
+            int seq = ++cbseq;
+            double ct = commit_time;
+            [command addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                fprintf(stderr, "CBDBG seq=%d commit_wall=%.3f gpu_end_wall=%.3f status=%lu\n",
+                        seq, ct, h3_gpu_now(), (unsigned long)cb.status);
+            }];
+        }
         h3_gpu_stats stats = gpu.stats;
         stats.submissions++;
         stats.command_encode_seconds += commit_time - gpu.commandStartWall;
@@ -2562,7 +2580,12 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim,
-                          MPSDataTypeBFloat16)) return 1;
+                          MPSDataTypeBFloat16)) {
+        if (getenv("H3_COND_DEBUG"))
+            fprintf(stderr, "LINEARDBG path=mps rows=%u in=%u out=%u\n",
+                    rows, input_dim, output_dim);
+        return 1;
+    }
     linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     if (!h3_gpu_require_command(gpu)) return 0;
@@ -2572,6 +2595,20 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"device cannot dispatch the 16x16 BF16 linear tile");
         return 0;
     }
+    if (getenv("H3_COND_DEBUG") && output_dim == 5376)
+        fprintf(stderr,
+                "LINEARDBG path=generic rows=%u in=%u out=%u bias=%u "
+                "inmem=%p..%p wmem=%p..%p outmem=%p..%p "
+                "w_elements=%zu w_bytes=%zu dispatch_wall=%.3f\n",
+                rows, input_dim, output_dim, args.has_bias,
+                TENSOR(input).buffer.contents,
+                (char *)TENSOR(input).buffer.contents + TENSOR(input).bytes,
+                TENSOR(weight).buffer.contents,
+                (char *)TENSOR(weight).buffer.contents + TENSOR(weight).bytes,
+                TENSOR(output).buffer.contents,
+                (char *)TENSOR(output).buffer.contents + TENSOR(output).bytes,
+                (size_t)TENSOR(weight).elements, (size_t)TENSOR(weight).bytes,
+                h3_gpu_now());
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
