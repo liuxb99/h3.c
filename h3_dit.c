@@ -2491,6 +2491,9 @@ static int h3_dump_tap_allowed(const h3_dit *dit, const char *name) {
     if (!state->selective) return 1;
     if (strncmp(name, "e", 1) == 0 || strncmp(name, "step0_", 6) == 0)
         return 1;
+    /* Refiner subtaps (rb0 / rb1 prefixed) emit during prep (dump_step < 0)
+     * and are gated solely by H3_REFINE_SUBTAP - allow them explicitly. */
+    if (strncmp(name, "rb", 2) == 0) return 1;
     if (strncmp(name, "b0_", 3) == 0 && dit->dump_step < 0) return 1;
     if (strncmp(name, "b0_", 3) != 0 && !h3_dump_steps_allowed(dit))
         return 0;
@@ -2553,6 +2556,7 @@ static void dit_dump_raw(h3_dit *dit, const void *values, size_t bytes,
     struct h3_dump_state *state = h3_dump_state_p();
     int infrastructure = !strncmp(name, "e", 1) ||
         strncmp(name, "step0_", 6) == 0 ||
+        strncmp(name, "rb", 2) == 0 ||
         (strncmp(name, "b0_", 3) == 0 && dit->dump_step < 0);
     int matches = infrastructure || h3_dump_tap_allowed(dit, name);
     int quota_ok = 1;

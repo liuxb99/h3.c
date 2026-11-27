@@ -24,7 +24,12 @@
 ## 獨立 Golden（FACT，語義 PASS）
 piH3 8390（官方 ComfyX 節點＋LakonLab pi_h3_4step DWD int8 adapter）同 prompt、512×288、length 39→輸出 39f、4-step、seed 1：逐幀 vision = 橘色虎斑小貓＋粉紅蝴蝶＋綠草地＋卡通風格＋晴天、無任何文字、動作連貫 → 原生引擎的 prompt 字幕化與場景偏離 = 引擎缺陷，非模型行為。證據存 EV/golden_comfy_official/（mp4 sha 88c375e8493ba65e…＋workflow＋NOTE.md）。另證 length≡5(mod17) 為官方幀契約（39 直接被接受）。
 
+## 子代理 B/C 報告（已收）
+- (B) 幀契約 = FACT 符合官方契約：h3_host.c:15-21 align ≡5 mod17（25→39）、latent_t=((39-5)/17)*5+2=12、audio_t=round(39*40/24)=65、序列 20+130+2640=2790、VAE chunks*17+5=39；與官方 nodes_minimax_h3.py:50-63 + ldm/minimax/vae.py 三式逐字相同（17k+5 網格：22/39/56；25 非網格值，引擎向上取整是官方行為）。無需修復。
+- (C) 前端差異清單：chat template 兩邊皆無（排除）、TE 第50層 unnormalized 相同（排除）、modality tags/attention 無 mask/cond pin timestep/shift 同式（排除）。實際差異：D1 引擎無 CFG（cond_scale≡1 單 pass）vs 官方 CFG>1 慣用（H1）、D2 sigma ladder 端點差異、D3 tokenizer 實作不同、D5 256×256 rope 0.5 特權路徑。註：native 輸出字幕≈逐字 prompt → text token 內容路徑存活（H2 tokenizer 漂移降級）；結合首偏離=refiner，主嫌仍是 text conditioning 流在 refiner 後被破壞（CFG 為次）。
+- P4E 已啟動（GPU）：native INT8 tiny 契約 × 3 語義 prompt（corgi 鋼琴 / 霓虹招牌 "OPEN 24 HOURS" 文字正向對照 / 中文茶座水墨）＋ rb* refiner subtaps。招牌正向對照：若招牌文字正確渲染而場景 prompt 偏離 → 文本路徑活、場景條件化斷。
+- dump 政策修復（commit 見下）：rb subtaps 於 prep(dump_step<0) 會被 selective 政策抑制 → h3_dit.c:2494 rb 前綴 explicit allow ＋ infrastructure 旗標加 rb（bypass quota）；helpers_dump.c 為未編譯草稿。
+
 ## 進行中
-- 子代理：A requant 契約 / B 幀契約引文 / C prompt 條件化 diff / D refiner 重放（全部 CPU）。
 - GPU 佇列：golden 完成前不啟動引擎重跑（串行規則）；chain_p4c.sh 待 refiner culprit 定案後改版再跑（原 block0 目標已被 refiner 首偏離取代）。
 - commit 7d581c4 = tap 名稱修復（僅 dump 路徑，零生產風險）。PR #1 維持 OPEN。
