@@ -31,6 +31,12 @@ piH3 8390（官方 ComfyX 節點＋LakonLab pi_h3_4step DWD int8 adapter）同 p
 - 全量掃描進行中（engine transformer 對 golden，damaged>1e-3 清單＋convrot 溯源旗標 → 產生可 patch 集）；patch 將做位元區間備份＋manifest，P4E 鏈完成後才套用以避免 mmap 混視。
 - 修復契約（A 提，待批格式）：不合格 int8 序列化的張量原 dtype 直通、禁 requant 往返；export 後 recon8 邏輯 audit；指標併報 RMSrel+cos。
 
+## P4E 三語義消融（FACT，256²×22f×2step native INT8，seed1）
+- 三 prompt（corgi鋼琴／霓虹招牌 OPEN 24 HOURS／中文茶座水墨）影片全部語義 FAIL：皆為同一泛型扭曲人形＋紅腫臉，無 corgi/鋼琴/招牌/茶座，且**連字幕都沒有**（與 640 臂的字幕化不同；2-step 小契約下連文字渲染能力也不存在，對招牌正向對照解釋力有限——標記為契约過小的混杂因素）。
+- tap 級判别（FACT）：跨 prompt 相似度 e1_text_source raw cos≈0.998（公共模態主導）→ 去均值後 p1~p2 0.28、p1~p3 −0.80、p2~p3 −0.80 = **TE/tokenizer 路徑在 tap 層確已產出 prompt 專屬內容**（H2「tokenizer 漂移致文本退化」進一步排除）。
+- e1_after_refiner0 跨 prompt cos 塌到 0.71–0.73、finalnorm 0.39–0.41：與「報銷的 refiner qkv 把 conditioning 信號搅成垃圾」一致（金標refiner 對同 prompt 的跨語義對照待 D 的 CPU oracle 復放補齊）。
+- token 數随 prompt 長度變（text_source 12/22/…行）為契約行為，非 bug。
+
 ## 子代理 B/C 報告（已收）
 - (B) 幀契約 = FACT 符合官方契約：h3_host.c:15-21 align ≡5 mod17（25→39）、latent_t=((39-5)/17)*5+2=12、audio_t=round(39*40/24)=65、序列 20+130+2640=2790、VAE chunks*17+5=39；與官方 nodes_minimax_h3.py:50-63 + ldm/minimax/vae.py 三式逐字相同（17k+5 網格：22/39/56；25 非網格值，引擎向上取整是官方行為）。無需修復。
 - (C) 前端差異清單：chat template 兩邊皆無（排除）、TE 第50層 unnormalized 相同（排除）、modality tags/attention 無 mask/cond pin timestep/shift 同式（排除）。實際差異：D1 引擎無 CFG（cond_scale≡1 單 pass）vs 官方 CFG>1 慣用（H1）、D2 sigma ladder 端點差異、D3 tokenizer 實作不同、D5 256×256 rope 0.5 特權路徑。註：native 輸出字幕≈逐字 prompt → text token 內容路徑存活（H2 tokenizer 漂移降級）；結合首偏離=refiner，主嫌仍是 text conditioning 流在 refiner 後被破壞（CFG 為次）。
