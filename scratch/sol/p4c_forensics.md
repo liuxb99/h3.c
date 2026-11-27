@@ -21,8 +21,10 @@
 次要：e2_video/audio_patch_w/b cos≈0.9997（量化噪點級，非根因）；b0_swiglu_out(=block49 s19 覆寫名) cos≈-0.0015（DiT 輸出兩臂完全不相關——下游全髒，不能歸因 DiT kernel）。
 推論：兩臂共享轉換後 condition/DiT 權重路徑（e3_condition_w_gpu 逐位相同）→ 先前 CPU 審計的 condition relRMS 0.23/0.27（轉換 vs 原始）為兩臂共享缺陷，不是臂間判別因子；refiner 才是臂間判別點 → 子代理 D 以 FP32 CPU 重放 refiner(原 HF 權重為 oracle)定位 culprit。
 
+## 獨立 Golden（FACT，語義 PASS）
+piH3 8390（官方 ComfyX 節點＋LakonLab pi_h3_4step DWD int8 adapter）同 prompt、512×288、length 39→輸出 39f、4-step、seed 1：逐幀 vision = 橘色虎斑小貓＋粉紅蝴蝶＋綠草地＋卡通風格＋晴天、無任何文字、動作連貫 → 原生引擎的 prompt 字幕化與場景偏離 = 引擎缺陷，非模型行為。證據存 EV/golden_comfy_official/（mp4 sha 88c375e8493ba65e…＋workflow＋NOTE.md）。另證 length≡5(mod17) 為官方幀契約（39 直接被接受）。
+
 ## 進行中
-- 獨立 Golden：piH3 8390 golden_cat 512×288 39f 4-step seed1 同 prompt（第 2 次提交已收 got prompt；首提因 json 雙層 wrapper 被拒）。產出後 vision 判語義（貓 vs 字幕）→ 定案前端契約。
 - 子代理：A requant 契約 / B 幀契約引文 / C prompt 條件化 diff / D refiner 重放（全部 CPU）。
 - GPU 佇列：golden 完成前不啟動引擎重跑（串行規則）；chain_p4c.sh 待 refiner culprit 定案後改版再跑（原 block0 目標已被 refiner 首偏離取代）。
 - commit 7d581c4 = tap 名稱修復（僅 dump 路徑，零生產風險）。PR #1 維持 OPEN。
