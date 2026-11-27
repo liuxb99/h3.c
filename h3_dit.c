@@ -2545,7 +2545,7 @@ static void dit_dump_raw(h3_dit *dit, const void *values, size_t bytes,
                          const char *dtype) {    if (!dit->dump_active || !values || !bytes) return;
     const char *name = tag;
     char prefixed[256];
-    if (dit->dump_all && dit->dump_step >= 0 && strncmp(tag, "b0_", 3) == 0) {
+    if (dit->dump_step >= 0 && strncmp(tag, "b0_", 3) == 0) {
         snprintf(prefixed, sizeof(prefixed), "b%u_s%d_%s", dit->dump_block,
                  dit->dump_step, tag + 3);
         name = prefixed;
