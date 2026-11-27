@@ -1644,7 +1644,24 @@ kernel void h3_quantize_bf16_int8_rows_scalar(
 
 /* Convert SDPA's head-major source directly to the row-major int8 layout used
  * by the projection. The gather replaces the removed BF16 transpose while
- * preserving fully coalesced int8 stores and the proven projection kernel. */
+ * preserving fully coalesced int8 stores and the proven projection kernel.
+ *
+ * CONVROT ROTATION (P3 root-cause fix): the native-mode out_proj weights are
+ * the checkpoint's rotated int8 payload loaded verbatim
+ * (load_native_int8_pair), so the gathered ROW-MAJOR activations must be
+ * Hadamard-rotated per 256-element group before absmax/quantization, with
+ * the identical digit-stage math and scale convention
+ * (scales[row] = clipped_max/127 * 1/16) as
+ * h3_rotate_quantize_bf16_int8_rows.  Without the rotation the activation
+ * and weight bases mismatch and out_proj collapses (measured: tap cos
+ * ~0.15 vs eager).  After gather the vectors sit in the same row-major
+ * layout the rotate kernel expects: one 256-group = 64 consecutive vectors
+ * = two adjacent simdgroups, so the four base-4 digits run as components,
+ * simd shuffles (lane bits 0-3), and the lane-half partner exchange
+ * (bit 4 + simdgroup parity inside the pair).  Two passes: pass 1 gathers
+ * and rotates for the row absmax, pass 2 re-gathers and re-rotates and
+ * writes int8 (input read 2x, no staging buffer), mirroring the proven
+ * rotate kernel. */
 kernel void h3_quantize_bf16_int8_head_major_to_rows_cached(
                            device const bfloat4 *input [[buffer(0)]],
                            device char4 *output [[buffer(1)]],
@@ -1665,34 +1682,78 @@ kernel void h3_quantize_bf16_int8_head_major_to_rows_cached(
             uint linear = tid + slot * THREADS;
             output[row * VECTORS_PER_ROW + linear] = char4(0);
         }
-        if (tid == 0) scales[row] = 1.0f;
+        if (tid == 0) scales[row] = 1.0f / 127.0f;
         return;
     }
-    thread bfloat4 values[VECTORS];
+    /* [parity][lane_half][pair][lane] double-buffered per wave, same race
+       protection as h3_rotate_quantize_bf16_int8_rows. */
+    threadgroup float4 exchange[2][2][4][32];
     threadgroup float scratch[8];
+    uint lane_half = simdgroup & 1;
+    uint pair = simdgroup >> 1;
     float local_max = 0.0f;
     #pragma clang loop unroll(full)
     for (uint slot = 0; slot < VECTORS; slot++) {
         uint linear = tid + slot * THREADS;
         uint head = linear >> 5;
         uint vector = linear & (VECTORS_PER_HEAD - 1);
-        bfloat4 value = input[
-            (head * args.rows + row) * VECTORS_PER_HEAD + vector];
-        values[slot] = value;
-        float4 f = float4(value);
+        float4 v = float4(input[
+            (head * args.rows + row) * VECTORS_PER_HEAD + vector]);
+        /* digit 0: components, in-register. */
+        v = float4(v.x + v.y + v.z - v.w, v.x + v.y - v.z + v.w,
+                   v.x - v.y + v.z + v.w, -v.x + v.y + v.z + v.w);
+        /* digits 1-2: lane bits 0-3, inside the simdgroup. */
+        for (uint bit : {1u, 4u}) {
+            float4 p1 = simd_shuffle_xor(v, bit);
+            float4 p2 = simd_shuffle_xor(v, bit << 1);
+            float4 p3 = simd_shuffle_xor(v, bit | (bit << 1));
+            v = v + p1 + p2 - p3;
+        }
+        /* digit 3: bit 4 by shuffle, bit 5 via the pair partner. */
+        exchange[slot & 1][lane_half][pair][lane] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            float4 p1 = simd_shuffle_xor(v, 16);
+            float4 p2 = exchange[slot & 1][1 - lane_half][pair][lane];
+            float4 p3 = exchange[slot & 1][1 - lane_half][pair][lane ^ 16];
+            v = v + p1 + p2 - p3;
+        }
         local_max = max(local_max,
-            max(max(fabs(f.x), fabs(f.y)), max(fabs(f.z), fabs(f.w))));
+            max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w))));
     }
     float max_abs = h3_int8_reduce_max(
         local_max, scratch, simdgroup, lane);
     float clipped_max = max_abs * args.clip;
     float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
     float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
-    if (tid == 0) scales[row] = scale;
+    /* Fold 1/sqrt(256)=1/16 into the stored scale; codes stay un-scaled,
+       exactly as the row-major rotate kernel. */
+    if (tid == 0) scales[row] = scale * 0.0625f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     #pragma clang loop unroll(full)
     for (uint slot = 0; slot < VECTORS; slot++) {
         uint linear = tid + slot * THREADS;
-        int4 quantized = int4(rint(float4(values[slot]) * inverse));
+        uint head = linear >> 5;
+        uint vector = linear & (VECTORS_PER_HEAD - 1);
+        float4 v = float4(input[
+            (head * args.rows + row) * VECTORS_PER_HEAD + vector]);
+        v = float4(v.x + v.y + v.z - v.w, v.x + v.y - v.z + v.w,
+                   v.x - v.y + v.z + v.w, -v.x + v.y + v.z + v.w);
+        for (uint bit : {1u, 4u}) {
+            float4 p1 = simd_shuffle_xor(v, bit);
+            float4 p2 = simd_shuffle_xor(v, bit << 1);
+            float4 p3 = simd_shuffle_xor(v, bit | (bit << 1));
+            v = v + p1 + p2 - p3;
+        }
+        exchange[slot & 1][lane_half][pair][lane] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            float4 p1 = simd_shuffle_xor(v, 16);
+            float4 p2 = exchange[slot & 1][1 - lane_half][pair][lane];
+            float4 p3 = exchange[slot & 1][1 - lane_half][pair][lane ^ 16];
+            v = v + p1 + p2 - p3;
+        }
+        int4 quantized = int4(rint(v * inverse));
         output[row * VECTORS_PER_ROW + linear] =
             char4(clamp(quantized, int4(-127), int4(127)));
     }
