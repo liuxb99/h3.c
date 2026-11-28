@@ -8,7 +8,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework Accelerate
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
-LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
+LIB_C := h3.c h3_host.c h3_gguf.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
@@ -33,7 +33,16 @@ h3_tests: tests/test_h3.o $(LIB_OBJ)
 h3_metal_tests: tests/test_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_native_rotquant_tests: tests/test_native_rotquant.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_bf16_tests: tests/test_bf16.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_native_loader_tests: tests/test_native_loader.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_gguf_tests: tests/test_gguf_loader.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_tokenizer_tests: tests/test_tokenizer.o $(LIB_OBJ)
@@ -83,6 +92,9 @@ h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
 
 h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
+
+harness_forward: tests/bench_dit.o $(LIB_OBJ)
+	./tests/bench_dit --forward --model-dir /Volumes/SSD2T/models/MiniMax-H3-comfy-int8/FL2VA/transformer --shaders /Users/cyliu99/AI/h3c_mac_20261125/h3c/metal/h3_shaders.metal --width 128 --height 128 --frames 1 --steps 1 --seed 1 $(HARNESS_ARGS)
 
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
@@ -196,6 +208,17 @@ real-parity: h3_real_prompt_test h3_real_dit_block_test
 tests/%.o: tests/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
+# Loader-only regression: native int8 sidecar metadata against real model
+# directories.  Engine's own store code, seconds to run, no GPU.
+tests/test_native_loader: tests/test_native_loader.o $(LIB_OBJ)
+	$(CC) $(CFLAGS) -o $@ tests/test_native_loader.o $(LIB_OBJ) $(LDLIBS)
+
+# GGUF v3 container regression against the pruned IQ1_S asset.  Reader-only,
+# no GPU.  Prerequisites stay .o-only: the implicit rule pulls generated .d
+# files into $^ and breaks the link (see probe_sidecar note below).
+tests/test_gguf_loader: tests/test_gguf_loader.o $(LIB_OBJ)
+	$(CC) $(CFLAGS) -o $@ tests/test_gguf_loader.o $(LIB_OBJ) $(LDLIBS)
+
 # Vendored from Iris. Keep the main project strict without rewriting this small
 # terminal editor for conversion diagnostics unrelated to H3.
 linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
@@ -213,3 +236,8 @@ clean:
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 \
 	libh3.a *.o *.d tests/*.o tests/*.d
+
+# Explicit rule: implicit rule pulled SDKSettings.json + headers into $^ via
+# the generated .d file, breaking the link (2026-11-28). Keep prerequisites .o-only.
+probe_sidecar: probe_sidecar.o h3_weights.o h3_safetensors.o h3_gpu.o
+	$(CC) -o $@ $^ $(LDLIBS)

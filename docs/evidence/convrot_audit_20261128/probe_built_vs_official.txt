@@ -1,0 +1,22 @@
+DIR MiniMax-H3-h3c-built -> OK shards=2
+  blocks.0.attn.out_proj.weight payload=I8
+    quant_info ok=1 group=256 convrot=1 err=
+  blocks.0.mlp.fc2.weight payload=I8
+    quant_info ok=1 group=256 convrot=1 err=
+  token_refiner.blocks.0.mlp.fc1.weight payload=BF16
+    quant_info ok=0 group=0 convrot=0 err=quantized weight lacks sidecar: token_refiner.blocks.0.mlp.fc1.weight
+  blocks.0.attn.qkv_proj.weight payload=I8
+    quant_info ok=1 group=256 convrot=1 err=
+  blocks.0.adaln_proj.linear.weight payload=I8
+    quant_info ok=1 group=64 convrot=1 err=
+DIR MiniMax-H3-comfy-int8 -> OK shards=2
+  blocks.0.attn.out_proj.weight payload=I8
+    quant_info ok=1 group=256 convrot=1 err=
+  blocks.0.mlp.fc2.weight payload=I8
+    quant_info ok=1 group=256 convrot=1 err=
+  token_refiner.blocks.0.mlp.fc1.weight payload=BF16
+    quant_info ok=0 group=0 convrot=0 err=quantized weight lacks sidecar: token_refiner.blocks.0.mlp.fc1.weight
+  blocks.0.attn.qkv_proj.weight payload=I8
+    quant_info ok=1 group=256 convrot=1 err=
+  blocks.0.adaln_proj.linear.weight payload=I8
+    quant_info ok=1 group=64 convrot=1 err=

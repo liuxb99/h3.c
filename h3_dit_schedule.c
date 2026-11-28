@@ -66,8 +66,12 @@ static h3_gpu_tensor *weight_bf16_2d(const h3_weight_store *store, h3_gpu *gpu,
                                      const char *name, uint64_t rows,
                                      uint64_t columns, char *error,
                                      size_t error_size) {
-    uint64_t shape[] = {rows, columns};
-    return h3_weight_load_bf16(store, gpu, name, 2, shape, error, error_size);
+    /* AdaLN projections are strict BF16 in the original checkpoint but
+       arrive convrot-int8 quantized in the comfy int8 pack; the auto
+       loader dequantizes on the GPU under the verified sidecar
+       contract, and behaves as plain h3_weight_load_bf16 otherwise. */
+    return h3_weight_load_bf16_auto(store, gpu, name, rows, columns,
+                                    error, error_size);
 }
 
 static void free_tensor(h3_gpu_tensor **tensor) {

@@ -1,0 +1,18 @@
+rows=183
+b0_attn_adaln_out      max 6.00 ulp      hits: 32/983808    maxabs: 0.0009766 engine |max|: 9.188
+b0_qkv_pre_norm        max 146.12 ulp    hits: 3771/3935232 maxabs: 0.125     engine |max|: 102
+b0_q_post_qknorm_rope  max 199.00 ulp    hits: 1206/1311744 maxabs: 0.03125   engine |max|: 11.31
+b0_k_post_qknorm_rope  max 331.00 ulp    hits: 1205/1311744 maxabs: 0.03125   engine |max|: 12.25
+b0_v_after_qkv         max 146.12 ulp    hits: 1330/1311744 maxabs: 0.125     engine |max|: 49.75
+b0_attention_out       max 11017.00 ulp  hits: 107464/1311744 maxabs: 0.125     engine |max|: 43
+b0_out_proj_out        max 170164.00 ulp hits: 405574/983808 maxabs: 4         engine |max|: 776
+b0_post_attn_hidden    max 40832.00 ulp  hits: 152507/983808 maxabs: 4         engine |max|: 876
+b0_mlp_adaln_in        max 61483.00 ulp  hits: 108316/983808 maxabs: 0.01562   engine |max|: 4.062
+b0_fc1_out             max 244318336.00 ulp hits: 2025177/5246976 maxabs: 0.125     engine |max|: 63.75
+b0_swiglu_out          max 362807434.00 ulp hits: 1416642/2623488 maxabs: 4         engine |max|: 3760
+b0_fc2_out             max 259883.00 ulp hits: 575229/983808 maxabs: 32        engine |max|: 2.33e+04
+b0_block_out           max 64640.00 ulp  hits: 222163/983808 maxabs: 16        engine |max|: 7.117e+04
+b0_rope_cos_table      max 0.00 ulp      hits: 0/8784       maxabs: 1.192e-07 engine |max|: 1
+b0_rope_sin_table      max 0.00 ulp      hits: 0/8784       maxabs: 5.96e-08  engine |max|: 1
+b0_rope_cos_bf16       max 0.00 ulp      hits: 0/8784       maxabs: 0         engine |max|: 1
+b0_rope_sin_bf16       max 0.00 ulp      hits: 0/8784       maxabs: 0         engine |max|: 1

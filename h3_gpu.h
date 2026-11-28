@@ -48,9 +48,13 @@ h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
                                        size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const int8_t *values,
+                                     size_t elements);
 /* Allocate shared Metal storage and pread BF16 payload directly into it. */
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
                                       uint64_t file_offset, size_t elements);
 /* Fill an existing shared BF16 buffer from a file. The tensor and its
@@ -75,6 +79,9 @@ int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
+/* Read an int8 tensor (rot-quant dumps, convrot payloads) to host memory. */
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
@@ -310,10 +317,38 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         uint32_t output_dim);
 /* Experimental M5 Metal 4 int8 MLP. Weights use one F32 scale per output
  * channel; activations are quantized dynamically with one F32 scale per row. */
+/* Materialize dequantized BF16 from int8 payload plus per-row float
+   scales (Comfy int8_tensorwise checkpoints). */
+int h3_gpu_dequant_int8_rows(h3_gpu *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *scales,
+                             uint32_t rows, uint32_t columns);
+/* Comfy convrot int8_tensorwise: folds inverse Hadamard rotation,
+   optional row permutation (interleaved qkv rows from blocked files)
+   and scales into the dequant.  had is the group-size Hadamard
+   (+-1 entries, row-major, uploaded once per group size); rowmap may
+   be NULL. */
+int h3_gpu_dequant_convrot(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *scales,
+                           const h3_gpu_tensor *had,
+                           const h3_gpu_tensor *rowmap,
+                           uint32_t rows, uint32_t columns,
+                           uint32_t groupsize);
 int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
                                 uint32_t columns);
+/* Native A8W8 (convrot space): fused Hadamard rotation + per-row dynamic
+ * int8 quantization of a BF16 activation, matching the checkpoint's rotated
+ * weights exactly (see h3_rotate_quantize_bf16_int8_rows).  Exposed for the
+ * FP32 CPU oracle test. */
+int h3_gpu_quantize_bf16_int8_rotated_rows(h3_gpu *gpu, h3_gpu_tensor *output,
+                                           h3_gpu_tensor *scales,
+                                           const h3_gpu_tensor *input,
+                                           uint32_t rows,
+                                           uint32_t dispatch_rows,
+                                           uint32_t columns, float clip);
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
@@ -530,6 +565,21 @@ int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                           const h3_gpu_tensor *rope_sin_f32,
                           uint32_t sequence, uint32_t query_heads,
                           uint32_t kv_heads, uint32_t head_dim);
+/* Sol-Attn block-sparse attention over bf16 row-major [rows, heads, 128]
+ * tensors; scratch tensors are caller-allocated and reused per call. */
+const unsigned char *h3_gpu_tensor_bytes(h3_gpu_tensor *tensor, size_t *length);
+int h3_gpu_zero_bf16(h3_gpu *gpu, h3_gpu_tensor *output, uint32_t rows,
+                     uint32_t cols);
+int h3_gpu_submit(h3_gpu *gpu);
+int h3_gpu_sol_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                         const h3_gpu_tensor *value, uint32_t sequence,
+                         uint32_t heads, uint32_t head_dim, float scale,
+                         uint32_t block, uint32_t video_start,
+                         uint32_t video_stop, float tau,
+                         h3_gpu_tensor *pooled, h3_gpu_tensor *scores,
+                         h3_gpu_tensor *thresholds, h3_gpu_tensor *sel_offsets,
+                         h3_gpu_tensor *sel_indices);
 int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *query,
                            const h3_gpu_tensor *key,

@@ -1,0 +1,220 @@
+{
+ "GGUF loader (R1-R2)": [
+  [
+   "aa95b9f",
+   "R2: GGUF v3 container reader (h3_gguf) + reader-only regression on pruned IQ1_S "
+  ],
+  [
+   "d7be295",
+   "R1 IQ1_S GGUF structural audit PASS: 532 tensors contiguity-exact (nkv=0, sd.cpp"
+  ],
+  [
+   "04a329d",
+   "research: R1-R7 closeout (independent oracle, sidecar naming probes official/eng"
+  ]
+ ],
+ "IQ1_S dequant (R3)": [
+  [
+   "ce6dd1c",
+   "R3: IQ1_S CPU reference dequant bit-exact vs pinned sd.cpp golden — 208/208 tens"
+  ]
+ ],
+ "pruned AdaLN (R5)": [],
+ "int8 convrot / native A8W8": [
+  [
+   "9d43bf1",
+   "evidence: convrot_audit_20261128 full loop — oracle PASS 250/250 (worst scale re"
+  ],
+  [
+   "21c5581",
+   "fix(gate): align sidecar key convention (full-key append, pinned from built head"
+  ],
+  [
+   "678f456",
+   "docs: A報告+引擎繼承FACT驗證 — convrot轉換損傷279張(token_refiner qkv整張報銷RMSrel1.40)已逐位繼承入mod"
+  ],
+  [
+   "2804797",
+   "docs(p4c): 640 s20 同契約兩臂 forensics — 首偏離定位 token_refiner(cos0.69), eager=噪點/nati"
+  ],
+  [
+   "bdeadcb",
+   "fix(metal): head-major out_proj quantize now applies proven Hadamard rotate (gat"
+  ],
+  [
+   "d8bdadf",
+   "docs(s3): Phase1 Sulphur-3 W4A8 格式研究——asym_w4a8_int8 契約(nibble packed I4+Lloyd-M"
+  ],
+  [
+   "1f9d773",
+   "fix(gpu): native 模式禁用隱式 zero-copy mmap 預設——根因：newBufferWithBytesNoCopy 包 MAP_PRI"
+  ],
+  [
+   "43f5b95",
+   "evidence: P3-B 首次 native A8W8 run — 功能 PASS（exit 0、swap 0、去雜 13.1s/step vs 基線 39"
+  ],
+  [
+   "7a67bb9",
+   "docs: native_convrot_int8 設計文件同步——旋轉矩陣語意更正（Sylvester→h4⊗4 XOR-conv, kernel 實作其轉置"
+  ],
+  [
+   "7597ad8",
+   "metal8 phase2 rot-quant kernel 定案+修競態, 新增 bit-exact CPU oracle 測試 (make h3_nativ"
+  ],
+  [
+   "8d1243f",
+   "metal: fix half-keyword collision breaking M5 TensorOps library compile; allocat"
+  ],
+  [
+   "974ffed",
+   "metal8 phase2 wiring: native convrot-int8 weight path gated by H3_NATIVE_INT8 — "
+  ],
+  [
+   "4b56147",
+   "metal8 phase1: A8W8 fast-path vs BF16 dual-dump chain comparison (FACT rel 0.115"
+  ],
+  [
+   "0720c7b",
+   "metal8 phase2: native A8W8 design doc + fused activation rot-quant kernel (compi"
+  ],
+  [
+   "4af2e70",
+   "生產模型 SHA256 manifest（DiT int8 convrot 34.04GB / NVFP4 TE 15.69GB / Video VAE 10."
+  ],
+  [
+   "8080d74",
+   "convrot 全量掃描 PASS：250/250 I8 張量 requant within1=1.0、max dev 1 code、scale_rel<=5."
+  ],
+  [
+   "5af4819",
+   "Convrot 語意三方驗收 PASS：upstream 包逐位對撞 8/8、CPU bit-exact 1.0、Metal kernel 值域偏差<1量化步（"
+  ],
+  [
+   "58d691d",
+   "convrot dequant 鏈完成：Metal kernel（Hadamard+scale+qkv rowmap 摺疊）+ host 分派（comfy_qu"
+  ],
+  [
+   "f137c6c",
+   "DiT 檔案 int8 直載：per-block 自動偵測 I8+row_scale+comfy_quant（語意讀自檔內 JSON，禁猜）；adaln/nor"
+  ],
+  [
+   "046faff",
+   "Loader 第一刀：F8_E4M3 dtype、未知 dtype 跳過註冊、__metadata__ 捕獲、I8/U8 一字节直入 GPU loader；缺口"
+  ]
+ ],
+ "sol-attn": [
+  [
+   "b9c998a",
+   "forward 逐 tap 對拍 PASS（block0/step0）：env-gated dump taps + eager 重放，全鏈值域相對偏差<=5.2"
+  ],
+  [
+   "b453376",
+   "sol-attn: 修復 block-pool 歸約 kernel（4-slot 部分和正確跨 thread 歸併）+ CPU 參考逐元素單元測試 PASS（0"
+  ],
+  [
+   "7f9d549",
+   "Sol-Attn v1：Metal 塊稀疏注意力（pool→scores μσ+τσ→select→exact+塊補償 online softmax），H3_S"
+  ],
+  [
+   "d0c8d1e",
+   "設計 v3：對齊 Sol-H3-Spark 兩段式架構（4步 draft 672x384 -> x2 upscaler + H3->LTX adapter ->"
+  ],
+  [
+   "cb137f0",
+   "設計文件 v2.1：模型佈局/render-flag/sol-attn/上採器架構/記憶體共存策略 + M0 腳本"
+  ]
+ ],
+ "W4A8/S3 research": [
+  [
+   "4bb83fb",
+   "docs(charter): 使用者定調——I8-grid 展開=第一階段基準(須報展開記憶體+二次量化誤差); 最終=packed INT4 常駐+kerne"
+  ],
+  [
+   "a6febd7",
+   "docs: W4A8 引擎開發計畫 Charter(Phase0-6+交付+證據管理, 含 Phase0 根因實測修正備註)"
+  ]
+ ],
+ "evidence/gates/tap forensics": [
+  [
+   "0df8c5b",
+   "fix(gate+st_io+builder): production sidecar naming = strip form (measured on off"
+  ],
+  [
+   "0d01453",
+   "gate triage label fix (global flat multiset sort, not per-row): M1 now correctly"
+  ],
+  [
+   "d84d5ad",
+   "R1 evidence loop closed: independent oracle 250/250 PASS merged to frozen manife"
+  ],
+  [
+   "612da7b",
+   "R2 load contract: loader/probe/--info parity built vs official verified; probe_s"
+  ],
+  [
+   "3083455",
+   "R1 closeout: gate rerun3 PASS verified (wrapper rc1 = grep zero-match false alar"
+  ],
+  [
+   "2f5f53c",
+   "docs(P4E): 3語義消融全FAIL(泛型人形,契约過小); tap級FACT: TE輸出prompt專屬(去均值cos -0.8~0.28), refi"
+  ],
+  [
+   "673f259",
+   "fix(dump): rb refiner subtaps selective-mode allowlist + infrastructure(quota) b"
+  ],
+  [
+   "7d581c4",
+   "fix(dump): selective mode now prefixes block/step index into block tap names (wa"
+  ],
+  [
+   "3e6aa7b",
+   "feat(dump): refiner block 子tap(rb0/rb1 norm1/qkv/q/k/v/sdpa/outproj/resid, H3_RE"
+  ],
+  [
+   "73d6e7b",
+   "docs(s3): s3_w4a8 下載完成+全檔 header 驗證(208 量化層四件套齊全, LloydMax codebook 實測, SHA 指紋 6"
+  ],
+  [
+   "33305eb",
+   "test+diag: P3-C 調查工具鏈——tap dump（quota/manifest/bin）、CONDDBG GPU readback、CBDBG c"
+  ],
+  [
+   "7248ed5",
+   "全 DiT forward 對拍 PASS（50 blocks×2 steps 雙模式重放）：H3_DUMP_ALL 全層儀改 + eager anchor/c"
+  ],
+  [
+   "0255075",
+   "Mac 移植：設計文件 v1 + O87 配方與 Flex manifest 歸檔"
+  ]
+ ],
+ "design docs": [
+  [
+   "1fe9a45",
+   "證據：Sol-Attn v1 A/B 慢3.4× FAIL ＋ 34G/15.7G 原件解鎖為 Comfy-Org 官方源；設計 v4（低記憶體引擎）＋折疊修正"
+  ],
+  [
+   "f14fe0a",
+   "M0/M1 驗收：端到端影片產出（int8 resident 去噪 8.8s@640x352）+ 證據記錄"
+  ],
+  [
+   "49cc2a5",
+   "設計文件 v2.1 + M1 int8 腳本"
+  ],
+  [
+   "d66be77",
+   "M2 折疊工具（合成單測 PASS）+ SelfLift ground-truth 源碼歸檔 + 設計文件 v2"
+  ]
+ ],
+ "metal/gpu fixes": [],
+ "other": [
+  [
+   "349e871",
+   "docs(p4c): 獨立Golden語義PASS(橘貓+蝴蝶+草地,無字幕,piH3官方路徑) → prompt字幕化=引擎缺陷定案 FACT; 證據 gol"
+  ],
+  [
+   "d9c3e39",
+   "證據：VAE 解碼走 CPU（MPS import 失敗、conv=0、32s）——solvae Metal 路徑待補"
+  ]
+ ]
+}

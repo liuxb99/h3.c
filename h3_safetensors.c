@@ -194,6 +194,7 @@ static h3_dtype h3_parse_dtype(const char *name) {
     if (!strcmp(name, "I64")) return H3_DTYPE_I64;
     if (!strcmp(name, "U64")) return H3_DTYPE_U64;
     if (!strcmp(name, "F64")) return H3_DTYPE_F64;
+    if (!strcmp(name, "F8_E4M3")) return H3_DTYPE_F8_E4M3;
     return H3_DTYPE_UNKNOWN;
 }
 
@@ -212,6 +213,7 @@ size_t h3_dtype_size(h3_dtype dtype) {
         case H3_DTYPE_I64:
         case H3_DTYPE_U64:
         case H3_DTYPE_F64: return 8;
+        case H3_DTYPE_F8_E4M3: return 1;
         case H3_DTYPE_UNKNOWN: return 0;
     }
     return 0;
@@ -232,6 +234,7 @@ const char *h3_dtype_name(h3_dtype dtype) {
         case H3_DTYPE_I64: return "I64";
         case H3_DTYPE_U64: return "U64";
         case H3_DTYPE_F64: return "F64";
+        case H3_DTYPE_F8_E4M3: return "F8_E4M3";
         case H3_DTYPE_UNKNOWN: return "UNKNOWN";
     }
     return "UNKNOWN";
@@ -419,14 +422,31 @@ int h3_st_read_header(const char *path, h3_st_header *header,
         }
         if (!strcmp(name, "__metadata__")) {
             free(name);
+            const char *meta_start = cursor.at;
             if (!h3_json_skip(&cursor)) goto fail;
+            size_t meta_len = (size_t)(cursor.at - meta_start);
+            header->metadata_json = malloc(meta_len + 1);
+            if (header->metadata_json) {
+                memcpy(header->metadata_json, meta_start, meta_len);
+                header->metadata_json[meta_len] = '\0';
+            }
         } else {
             h3_st_tensor tensor;
             memset(&tensor, 0, sizeof(tensor));
             tensor.name = name;
-            if (!h3_parse_tensor(&cursor, &tensor) ||
-                !h3_validate_tensor(&cursor, &tensor, 8 + header_size, file_size) ||
-                !h3_append_tensor(header, tensor, &capacity, &cursor)) {
+            if (!h3_parse_tensor(&cursor, &tensor)) {
+                free(tensor.name);
+                goto fail;
+            }
+            if (tensor.dtype == H3_DTYPE_UNKNOWN) {
+                /* Sidecar payload with a dtype this engine does not
+                   interpret (e.g. F8_E4M3 block scales): the entry is
+                   fully parsed so the cursor stays aligned, but it is
+                   deliberately not registered. */
+                free(tensor.name);
+                tensor.name = NULL;
+            } else if (!h3_validate_tensor(&cursor, &tensor, 8 + header_size, file_size) ||
+                       !h3_append_tensor(header, tensor, &capacity, &cursor)) {
                 free(tensor.name);
                 goto fail;
             }
@@ -461,9 +481,9 @@ fail:
 
 void h3_st_free_header(h3_st_header *header) {
     if (!header) return;
-    for (size_t index = 0; index < header->tensor_count; index++) {
+    for (size_t index = 0; index < header->tensor_count; index++)
         free(header->tensors[index].name);
-    }
+    free(header->metadata_json);
     free(header->tensors);
     free(header->path);
     memset(header, 0, sizeof(*header));

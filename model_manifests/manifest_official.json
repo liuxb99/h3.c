@@ -1,0 +1,36 @@
+{
+  "asset_id": "official_convrot_reference",
+  "role": "read_only_reference_baseline (Comfy-Org official int8_convrot download; DO NOT write)",
+  "compatible_engines": [
+    "comfy_core (grouped row slicing) \u2014 NOT h3c_native (refiner qkv layout defect for interleaved consumers)"
+  ],
+  "layout_contract": {
+    "main_block_fused_qkv_i8": "grouped_rows",
+    "token_refiner_qkv_passthrough": "grouped (legacy defect vs HF interleaved canonical)",
+    "passthrough_bf16": "official values (279 regions diverge from HF golden)"
+  },
+  "quant_method": "int8_convrot (official recipe)",
+  "assets": [
+    {
+      "name": "minimax_h3_ref2va_int8_convrot",
+      "path": "/Volumes/SSD2T/models/MiniMax-H3-comfy-int8/minimax_h3_ref2va_int8_convrot.safetensors",
+      "expected_sha256": "9eef934046a0671bc8a5daf87100705e1478419c574cfde70c50fbe6885f76a9",
+      "size_bytes": 34038894550,
+      "read_only": true,
+      "freeze_pending": false
+      }
+  ],
+  "lineage": {
+    "parent_asset": "Comfy-Org Minimax-H3 int8_convrot release (LFS oid 9eef9340...)",
+    "provenance_evidence": "pre-patch regions preserved in scratch/sol/engine_backup_prepatch/ (manifest + .old.bin, sha_before verified); 2026-11-27 14:31 patch mutated 279 regions in place; revert to official bytes in progress 2026-11-28"
+  },
+  "known_defects": [
+    "token_refiner fused-qkv pass-through stored grouped while HF canonical is per-head interleaved (root cause of p4b native refiner divergence)"
+  ],
+  "recorded_at": "2026-11-28T01:30:00+08:00",
+  "verification_status": "REVERT_DONE (2026-11-28T03:5x CST+8): HF-staged file verified full sha256==9eef9340 (RELEASE_SHA_OK) and atomically installed over live file; frozen chmod a-w + chflags uchg (uchg confirmed in ls -lO). Pre-patch local bytes 39789f8c proven divergent from release BEFORE patch (baseline residual: condition_proj.w/b, final_layer.adaln_proj.w/b, token_refiner.final_norm.weight — 5 off-279 tensors per release_disambig_verdict.txt). Disambiguation CLASS=MIXED: engine deviates from release on ALL 279 patched regions AND from MiniMaxAI on 10/12 patched samples; engine reference contract = release file only.",
+   "golden_use_allowed": true,
+   "live_sha256_20261128": "9eef934046a0671bc8a5daf87100705e1478419c574cfde70c50fbe6885f76a9",
+  "pre_patch_local_sha256_20261128": "39789f8c8528a69f40947be4027648c76fc76372c5f7330555c573ae2d896dfb",
+  "expected_sha256_note": "kept 9eef9340... = HF LFS oid (target state after re-download)"
+}

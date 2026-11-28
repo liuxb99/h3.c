@@ -1,0 +1,9 @@
+[10:49:40] candidate: 250 quantized subjects, 285 pass-through keys, sidecar entries 500
+[10:49:41] [S/S0] sidecar structure checked on 250 subjects, failures so far 0
+[10:50:38] [P] pass-through: 285 byte-identical, 0 mismatched, 0 skipped
+[10:58:35] [Q/L] 50/250 quantized checked, failures 0
+[11:04:22] [Q/L] 100/250 quantized checked, failures 0
+[11:12:32] [Q/L] 150/250 quantized checked, failures 0
+[11:14:52] [Q/L] 200/250 quantized checked, failures 0
+[11:17:06] [Q/L] 250/250 quantized checked, failures 0
+[11:17:06] SUMMARY {"candidate": "/Volumes/SSD2T/models/MiniMax-H3-h3c-built/minimax_h3_ref2va_int8_convrot_h3c.safetensors", "references": ["/Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3-flex-ref2va/Ref2VA/transformer"], "n_quantized": 250, "n_pass_through": 285, "pass_through_pass": 285, "pass_through_fail": 0, "pass_through_skip": 0, "failures": 0, "expect_layout": "grouped", "verdict": "PASS", "quant_cos_fileorder": {"n": 250, "min": 0.006215083175598405, "p05": 0.010706140417896097, "median": 0.9999483614714605, "below_cos_min": 50}, "qkv_layout": {"n": 50, "inter_min": 0.006215083175598405, "inter_mean": 0.012658755733208366, "grouped_min": 0.999952702666782, "grouped_max": 0.9999536482145606}}

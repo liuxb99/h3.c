@@ -1,0 +1,5 @@
+{"file":"/Volumes/SSD2T/models/MiniMax-H3-comfy-int8/minimax_h3_ref2va_int8_convrot.safetensors","bytes":34038894550,"sha256":"9eef934046a0671bc8a5daf87100705e1478419c574cfde70c50fbe6885f76a9"}
+{"file":"/Volumes/SSD2T/models/MiniMax-H3-comfy-int8/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors","bytes":15687142551,"sha256":"35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6"}
+{"file":"/Volumes/SSD2T/models/MiniMax-H3-comfy-int8/FL2VA/video_vae/source/model.safetensors","bytes":10415548320,"sha256":"5f0c2e161d895a9fee7645ca32d4a7e3a22b90cacfcbeba62ec999cdbbefe0d3"}
+{"file":"/Volumes/SSD2T/models/MiniMax-H3-comfy-int8/FL2VA/audio_vae/model.safetensors","bytes":605429308,"sha256":"37dddc2f3e6d5d5139d823d5ea283bbf304dadcb885b1ccda818aa13dade5ea2"}
+SHA_DONE

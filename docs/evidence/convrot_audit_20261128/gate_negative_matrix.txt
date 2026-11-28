@@ -1,0 +1,8 @@
+qkv_layout_gate negative-rejection matrix  (seed=20261128, thresholds: cos-min 0.999 relrms-max 0.05 expect-layout grouped, defaults not loosened)
+CONTROL_correct        expected=accept  result=PASS exit=0 verdict=PASS
+M1_qkv_inter_order     expected=reject  result=PASS exit=2 [13:34:33] FAIL [L] blocks.0.attn.qkv_proj.weight PERMUTATION inter=0.999965 grouped=0.332708 expect=grouped
+M2_scale_x2            expected=reject  result=PASS exit=2 [13:34:34] FAIL [Q] blocks.0.attn.out_proj.weight PERMUTATION cos=0.999966 relrms=0.998628
+M3_double_hadamard     expected=reject  result=PASS exit=2 [13:34:35] FAIL [Q] blocks.0.mlp.fc1.weight QUANT_DRIFT cos=0.061149 relrms=1.369906
+M4_codes_bitflip       expected=reject  result=PASS exit=2 [13:34:36] FAIL [Q] blocks.0.mlp.fc2.weight QUANT_DRIFT cos=0.998957 relrms=0.045670
+M5_missing_comfy_quant expected=reject  result=PASS exit=2 [13:34:37] FAIL [P] blocks.1.attn.out_proj.weight  dtype/shape I8[256, 512] vs ref BF16[256, 512]
+ALL EXPECTED

@@ -1317,6 +1317,226 @@ kernel void h3_fc1_swiglu_bf16_nax_r128_morton4(
 /* Draw Things/ccv-style dynamic symmetric row quantization. Weight rows are
  * checkpoint output channels; activation rows include zero-padded M tails so
  * the int8 matmuls can keep a fully static 128x128x128 descriptor. */
+kernel void h3_dequant_int8_rows(device const int8_t *input [[buffer(0)]],
+                                  device ushort *output [[buffer(1)]],
+                                  device const float *scales [[buffer(2)]],
+                                  constant int8_quant_args &args [[buffer(3)]],
+                                  uint tid [[thread_position_in_grid]]) {
+    device const char4 *input4 =
+        reinterpret_cast<device const char4 *>(input);
+    device ushort4 *output4 = reinterpret_cast<device ushort4 *>(output);
+    uint vectors = args.rows * (args.columns / 4);
+    if (tid >= vectors) return;
+    {
+        uint vector = tid;
+        uint row = vector / (args.columns / 4);
+        float scale = scales[row];
+        char4 value = input4[vector];
+        output4[vector] = ushort4(
+            h3_f32_to_bf16((float)value.x * scale),
+            h3_f32_to_bf16((float)value.y * scale),
+            h3_f32_to_bf16((float)value.z * scale),
+            h3_f32_to_bf16((float)value.w * scale));
+    }
+}
+
+/* Comfy convrot int8_tensorwise weights: the file stores the *rotated*
+ * weight (W_rot = W @ H_group^T, regular normalized Hadamard over
+ * group-size blocks of the reduction axis) with per-row F32 scales, and
+ * qkv tensors additionally have their rows permuted from the native
+ * per-head interleaved order into q/k/v blocks.  This kernel folds the
+ * inverse rotation (multiply by H, symmetric), the row permutation and
+ * the scale into the dequant so consumers receive the exact original
+ * BF16 weight.  had is the H matrix transposed (had[j*G+k]) uploaded
+ * once per group size. */
+typedef struct { uint32_t rows, columns, groupsize, has_map; float invsqrt; } convrot_dequant_args;
+
+kernel void h3_dequant_convrot_rows(
+                       device const int8_t *input [[buffer(0)]],
+                       device ushort *output [[buffer(1)]],
+                       device const float *scales [[buffer(2)]],
+                       constant convrot_dequant_args &args [[buffer(3)]],
+                       device const uint *rowmap [[buffer(4)]],
+                       device const float *had [[buffer(5)]],
+                       uint3 tgid [[threadgroup_position_in_grid]],
+                       uint3 tid [[thread_position_in_threadgroup]]) {
+    uint row = tgid.x;
+    uint block = tgid.y;
+    uint lane = tid.x;
+    uint groups = args.columns / args.groupsize;
+    if (row >= args.rows || block >= groups) return;
+    uint src = args.has_map ? rowmap[row] : row;
+    threadgroup int8_t block_values[256];
+    if (lane < args.groupsize) {
+        block_values[lane] = input[src * args.columns + block * args.groupsize
+                                   + lane];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane >= args.groupsize) return;
+    float acc = 0.0f;
+    device const float *had_row = had + (size_t)lane * args.groupsize;
+    for (uint k = 0; k < args.groupsize; k++) {
+        acc += (float)block_values[k] * had_row[k];
+    }
+    output[row * args.columns + block * args.groupsize + lane] =
+        h3_f32_to_bf16(acc * scales[src] * args.invsqrt);
+}
+
+/* Native A8W8: fused activation Hadamard rotation + per-row dynamic INT8
+ * quantization.  The convrot files store rotated weights (W_rot = W @ H_g^T;
+ * see h3_dequant_convrot_rows), so the native INT8 GEMM must consume
+ * activations rotated by the TRANSPOSE of the exact table dit_had() builds:
+ * H = kron^4(h4), h4[a][b] = -1 iff a XOR b == 3 (the ComfyX convrot_w4a4
+ * Walsh matrix, NOT the Sylvester/Walsh-Paley H2^kron matrix).  Because
+ * h4 is an XOR-convolution matrix (out[a] = v[a]+v[a^1]+v[a^2]-v[a^3]),
+ * each base-4 digit of the 256-group is one independent XOR-convolution
+ * stage, which is exactly what the digit stages below compute, so no H
+ * matrix traffic is needed.  A plain Sylvester FWLT is a DIFFERENT
+ * orthogonal matrix; feeding it permuted inputs does not reconcile them
+ * (verified numerically: no input permutation makes FWLT match the table).
+ * Threadgroup = one row x 192 threads: 6 simdgroups process 256-element
+ * convrot blocks in pairs (2 simdgroups per block, 3 blocks per wave).
+ * Each lane owns 4 contiguous elements; the four digit stages run as:
+ * digit 0 in-register on the float4 components (bits 0-1), digits 1-2 as
+ * simd_shuffle_xor pairs (lane bits 0-1 and 2-3 = element bits 2-5), and
+ * digit 3 (element bits 6-7 = lane bit 4 XOR lane_half) via the
+ * simdgroup-pair exchange through threadgroup memory.  H has +-1 entries;
+ * the orthonormal 1/16 fold is applied to the stored SCALE (codes are
+ * scale-invariant), so qa * scale_a reproduces exactly (H a)/16, matching
+ * the dequantized-weight reference W_eff = (H q)/16 * scale_w.  Per-row
+ * scale semantics otherwise match h3_quantize_bf16_int8_rows exactly
+ * (clipped absmax / 127), computed over the ROTATED values.
+ * Second pass reloads and re-rotates (input read 2x, output written 1x, no
+ * bf16 staging buffer).  columns must be a multiple of 256 (all four
+ * convrot linears qualify). */
+kernel void h3_rotate_quantize_bf16_int8_rows(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_quant_args &args [[buffer(3)]],
+                           uint row [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint THREADS = 192;
+    /* Double-buffered across waves (parity indexed): without the parity
+     * slot, a fast simdgroup's next-wave write can clobber a slow
+     * simdgroup's same-wave partner read — the single barrier only
+     * orders write->read, not read->next-write. Measured symptom: one
+     * scale row off ~4% (partial-wave absmax) roughly once per full
+     * suite run at rows=2048 cols=7168. */
+    threadgroup float4 exchange[2][2][3][32];
+    threadgroup float reduce[8];
+    uint base = row * args.columns;
+    if (row >= args.rows) {
+        /* Zero only this padding row: threadgroup execution order is
+         * undefined, zeroing [0, row*cols/4) could clobber live rows. */
+        device char4 *output4 = reinterpret_cast<device char4 *>(output);
+        uint vector_base = row * (args.columns / 4);
+        uint vectors = args.columns / 4;
+        for (uint column = tid; column < vectors; column += THREADS)
+            output4[vector_base + column] = char4(0);
+        if (tid == 0) scales[row] = 1.0f / 127.0f;
+        return;
+    }
+    uint nblocks = args.columns / 256;
+    uint waves = (nblocks + 2) / 3;
+    uint pair = simdgroup >> 1;          /* 0..2: which block of the wave */
+    uint lane_half = simdgroup & 1;      /* 0: s=lane, 1: s=lane+32 */
+    uint slot = lane_half * 32 + lane;   /* vector index inside the block */
+    /* The checkpoint Hadamard is a kron power of the Walsh matrix h4
+     * with entries -1 iff a XOR b == 3 (ComfyX convrot_w4a4
+     * _build_hadamard).  Per base-4 digit the transform is the XOR
+     * convolution out[a] = v[a] + v[a^1] + v[a^2] - v[a^3], i.e.
+     * out = sum(v) - 2 * reverse4(v) after the partners arrive.  The
+     * four digits of the 256-group are: component bits (inside the
+     * float4), lane bits 0-1, lane bits 2-3 (simd shuffles), and
+     * (lane bit 4, lane_half) which crosses the two simdgroups of a
+     * threadgroup via shared memory.  A plain Sylvester FWLT is a
+     * DIFFERENT orthogonal matrix than this kron power; feeding it
+     * permuted inputs does not fix that (verified numerically). */
+    float local_max = 0.0f;
+    for (uint wave = 0; wave < waves; wave++) {
+        uint block = 3 * wave + pair;
+        bool live = block < nblocks;
+        device const bfloat4 *input4 =
+            reinterpret_cast<device const bfloat4 *>(input);
+        float4 v = live ? float4(input4[base / 4 + block * 64 + slot])
+                        : float4(0.0f);
+        /* digit 0: component bits, in-register. */
+        v = float4(v.x + v.y + v.z - v.w, v.x + v.y - v.z + v.w,
+                   v.x - v.y + v.z + v.w, -v.x + v.y + v.z + v.w);
+        /* digits 1-2: lane bit pairs, staying inside the simdgroup. */
+        for (uint bit : {1u, 4u}) {
+            float4 p1 = simd_shuffle_xor(v, bit);
+            float4 p2 = simd_shuffle_xor(v, bit << 1);
+            float4 p3 = simd_shuffle_xor(v, bit | (bit << 1));
+            v = v + p1 + p2 - p3;
+        }
+        /* digit 3: lane bit 4 XOR lane_half, across the simdgroup pair. */
+        if (live)        exchange[wave & 1][lane_half][pair][lane] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            float4 p1 = simd_shuffle_xor(v, 16);
+            float4 p2 = exchange[wave & 1][1 - lane_half][pair][lane];
+            float4 p3 = exchange[wave & 1][1 - lane_half][pair][lane ^ 16];
+            v = v + p1 + p2 - p3;
+        }
+        if (!live) continue;  /* dead-block lanes hold stale exchange data:
+                               * keep them out of the row absmax */
+        /* No 1/sqrt(G) here: the dequant path normalizes with
+         * args.invsqrt on the OUTPUT side (W_eff = W_rot@H / 16), and the
+         * GEMM pairs raw rotated activations with raw rotated weights, so
+         * the activation side must NOT fold 1/16 or the product drifts 256x. */
+        local_max = max(local_max, max(max(fabs(v.x), fabs(v.y)),
+                                       max(fabs(v.z), fabs(v.w))));
+        /* (quantize happens in the second pass; rotated value is recomputed) */
+        (void)v;
+    }
+    float max_abs = h3_int8_reduce_max(local_max, reduce, simdgroup, lane);
+    float clipped_max = max_abs * args.clip;
+    float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
+    float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
+    /* Fold 1/sqrt(G)=1/16 into the stored scale, not the quantized codes:
+     * the dequant reference is W_eff = (H q)/16 * scale_w, and the GEMM
+     * epilogue multiplies qa * scale_a, so qa * scale_a must reproduce
+     * (H a)/16.  Codes are invariant to the fold (power-of-two scaling
+     * cancels inside rint(v * 127 / amax)). */
+    if (tid == 0) scales[row] = scale * 0.0625f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device char4 *output4 = reinterpret_cast<device char4 *>(output);
+    for (uint wave = 0; wave < waves; wave++) {
+        uint block = 3 * wave + pair;
+        if (block >= nblocks) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            continue;
+        }
+        device const bfloat4 *input4 =
+            reinterpret_cast<device const bfloat4 *>(input);
+        float4 v = float4(input4[base / 4 + block * 64 + slot]);
+        v = float4(v.x + v.y + v.z - v.w, v.x + v.y - v.z + v.w,
+                   v.x - v.y + v.z + v.w, -v.x + v.y + v.z + v.w);
+        for (uint bit : {1u, 4u}) {
+            float4 p1 = simd_shuffle_xor(v, bit);
+            float4 p2 = simd_shuffle_xor(v, bit << 1);
+            float4 p3 = simd_shuffle_xor(v, bit | (bit << 1));
+            v = v + p1 + p2 - p3;
+        }
+        exchange[wave & 1][lane_half][pair][lane] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            float4 p1 = simd_shuffle_xor(v, 16);
+            float4 p2 = exchange[wave & 1][1 - lane_half][pair][lane];
+            float4 p3 = exchange[wave & 1][1 - lane_half][pair][lane ^ 16];
+            v = v + p1 + p2 - p3;
+        }
+        int4 quantized = int4(rint(v * inverse));
+        output4[base / 4 + block * 64 + slot] =
+            char4(clamp(quantized, int4(-127), int4(127)));
+    }
+}
+
 kernel void h3_quantize_bf16_int8_rows(
                            device const bfloat *input [[buffer(0)]],
                            device int8_t *output [[buffer(1)]],
@@ -1424,7 +1644,24 @@ kernel void h3_quantize_bf16_int8_rows_scalar(
 
 /* Convert SDPA's head-major source directly to the row-major int8 layout used
  * by the projection. The gather replaces the removed BF16 transpose while
- * preserving fully coalesced int8 stores and the proven projection kernel. */
+ * preserving fully coalesced int8 stores and the proven projection kernel.
+ *
+ * CONVROT ROTATION (P3 root-cause fix): the native-mode out_proj weights are
+ * the checkpoint's rotated int8 payload loaded verbatim
+ * (load_native_int8_pair), so the gathered ROW-MAJOR activations must be
+ * Hadamard-rotated per 256-element group before absmax/quantization, with
+ * the identical digit-stage math and scale convention
+ * (scales[row] = clipped_max/127 * 1/16) as
+ * h3_rotate_quantize_bf16_int8_rows.  Without the rotation the activation
+ * and weight bases mismatch and out_proj collapses (measured: tap cos
+ * ~0.15 vs eager).  After gather the vectors sit in the same row-major
+ * layout the rotate kernel expects: one 256-group = 64 consecutive vectors
+ * = two adjacent simdgroups, so the four base-4 digits run as components,
+ * simd shuffles (lane bits 0-3), and the lane-half partner exchange
+ * (bit 4 + simdgroup parity inside the pair).  Two passes: pass 1 gathers
+ * and rotates for the row absmax, pass 2 re-gathers and re-rotates and
+ * writes int8 (input read 2x, no staging buffer), mirroring the proven
+ * rotate kernel. */
 kernel void h3_quantize_bf16_int8_head_major_to_rows_cached(
                            device const bfloat4 *input [[buffer(0)]],
                            device char4 *output [[buffer(1)]],
@@ -1445,34 +1682,78 @@ kernel void h3_quantize_bf16_int8_head_major_to_rows_cached(
             uint linear = tid + slot * THREADS;
             output[row * VECTORS_PER_ROW + linear] = char4(0);
         }
-        if (tid == 0) scales[row] = 1.0f;
+        if (tid == 0) scales[row] = 1.0f / 127.0f;
         return;
     }
-    thread bfloat4 values[VECTORS];
+    /* [parity][lane_half][pair][lane] double-buffered per wave, same race
+       protection as h3_rotate_quantize_bf16_int8_rows. */
+    threadgroup float4 exchange[2][2][4][32];
     threadgroup float scratch[8];
+    uint lane_half = simdgroup & 1;
+    uint pair = simdgroup >> 1;
     float local_max = 0.0f;
     #pragma clang loop unroll(full)
     for (uint slot = 0; slot < VECTORS; slot++) {
         uint linear = tid + slot * THREADS;
         uint head = linear >> 5;
         uint vector = linear & (VECTORS_PER_HEAD - 1);
-        bfloat4 value = input[
-            (head * args.rows + row) * VECTORS_PER_HEAD + vector];
-        values[slot] = value;
-        float4 f = float4(value);
+        float4 v = float4(input[
+            (head * args.rows + row) * VECTORS_PER_HEAD + vector]);
+        /* digit 0: components, in-register. */
+        v = float4(v.x + v.y + v.z - v.w, v.x + v.y - v.z + v.w,
+                   v.x - v.y + v.z + v.w, -v.x + v.y + v.z + v.w);
+        /* digits 1-2: lane bits 0-3, inside the simdgroup. */
+        for (uint bit : {1u, 4u}) {
+            float4 p1 = simd_shuffle_xor(v, bit);
+            float4 p2 = simd_shuffle_xor(v, bit << 1);
+            float4 p3 = simd_shuffle_xor(v, bit | (bit << 1));
+            v = v + p1 + p2 - p3;
+        }
+        /* digit 3: bit 4 by shuffle, bit 5 via the pair partner. */
+        exchange[slot & 1][lane_half][pair][lane] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            float4 p1 = simd_shuffle_xor(v, 16);
+            float4 p2 = exchange[slot & 1][1 - lane_half][pair][lane];
+            float4 p3 = exchange[slot & 1][1 - lane_half][pair][lane ^ 16];
+            v = v + p1 + p2 - p3;
+        }
         local_max = max(local_max,
-            max(max(fabs(f.x), fabs(f.y)), max(fabs(f.z), fabs(f.w))));
+            max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w))));
     }
     float max_abs = h3_int8_reduce_max(
         local_max, scratch, simdgroup, lane);
     float clipped_max = max_abs * args.clip;
     float scale = clipped_max > 0.0f ? clipped_max / 127.0f : 1.0f / 127.0f;
     float inverse = clipped_max > 0.0f ? 127.0f / clipped_max : 127.0f;
-    if (tid == 0) scales[row] = scale;
+    /* Fold 1/sqrt(256)=1/16 into the stored scale; codes stay un-scaled,
+       exactly as the row-major rotate kernel. */
+    if (tid == 0) scales[row] = scale * 0.0625f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     #pragma clang loop unroll(full)
     for (uint slot = 0; slot < VECTORS; slot++) {
         uint linear = tid + slot * THREADS;
-        int4 quantized = int4(rint(float4(values[slot]) * inverse));
+        uint head = linear >> 5;
+        uint vector = linear & (VECTORS_PER_HEAD - 1);
+        float4 v = float4(input[
+            (head * args.rows + row) * VECTORS_PER_HEAD + vector]);
+        v = float4(v.x + v.y + v.z - v.w, v.x + v.y - v.z + v.w,
+                   v.x - v.y + v.z + v.w, -v.x + v.y + v.z + v.w);
+        for (uint bit : {1u, 4u}) {
+            float4 p1 = simd_shuffle_xor(v, bit);
+            float4 p2 = simd_shuffle_xor(v, bit << 1);
+            float4 p3 = simd_shuffle_xor(v, bit | (bit << 1));
+            v = v + p1 + p2 - p3;
+        }
+        exchange[slot & 1][lane_half][pair][lane] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            float4 p1 = simd_shuffle_xor(v, 16);
+            float4 p2 = exchange[slot & 1][1 - lane_half][pair][lane];
+            float4 p3 = exchange[slot & 1][1 - lane_half][pair][lane ^ 16];
+            v = v + p1 + p2 - p3;
+        }
+        int4 quantized = int4(rint(v * inverse));
         output[row * VECTORS_PER_ROW + linear] =
             char4(clamp(quantized, int4(-127), int4(127)));
     }
@@ -4329,4 +4610,216 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float value = h3_bf16_to_f32(gate[gid]);
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
+}
+
+/* ---- Sol-Attn block-sparse attention (reference: "Sol-Attention",
+ * arXiv 2607.24027). Prefix rows and all prefix KV blocks keep exact
+ * attention; target video rows attend selected KV blocks exactly and
+ * every dropped block contributes its pooled-value estimate weighted by
+ * its pooled block score on the same online softmax denominator. ---- */
+struct sol_pool_args { uint sequence, heads, block, video_start, video_stop; };
+kernel void h3_sol_block_pool_bf16(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *pooled [[buffer(3)]],
+        constant sol_pool_args &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 posn [[thread_position_in_threadgroup]]) {
+    uint tid = posn.x;
+    uint i = group.x, h = group.y, which = group.z;
+    uint nqb = (args.sequence + args.block - 1u) / args.block;
+    if (i >= nqb || h >= args.heads) return;
+    device const ushort *src = which == 0u ? query : (which == 1u ? key : value);
+    uint row0 = i * args.block, row1 = min(row0 + args.block, args.sequence);
+    uint lo = max(row0, args.video_start), hi = min(row1, args.video_stop);
+    uint count = hi > lo ? hi - lo : 0u;
+    size_t out = ((size_t)which * args.heads + h) * nqb * 128u + (size_t)i * 128u;
+    if (count == 0u) { if (tid < 128u) pooled[out + tid] = 0u; return; }
+    float sum = 0.0f;
+    for (uint row = lo; row < hi; ++row)
+        sum += h3_bf16_to_f32(src[((size_t)row * args.heads + h) * 128u + tid]);
+    pooled[out + tid] = h3_f32_to_bf16(sum / (float)count);
+}
+
+struct sol_scores_args { uint nqb, heads, video_first, video_last, video_start, video_stop; float scale, tau; };
+kernel void h3_sol_block_scores_bf16(
+        device const ushort *pooled [[buffer(0)]],
+        device float *scores [[buffer(1)]],
+        device float *thresholds [[buffer(2)]],
+        constant sol_scores_args &args [[buffer(3)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint2 tid [[thread_position_in_threadgroup]]) {
+    uint h = group.x, i = group.y * 128u + tid.x;
+    if (i >= args.nqb) return;
+    size_t cq = ((size_t)h * args.nqb + i) * 128u;
+    uint block0 = i * 128u, block1 = block0 + 128u;
+    bool intersects = block0 < args.video_stop && block1 > args.video_start &&
+                      args.video_last > args.video_first;
+    bool fully = block0 >= args.video_start && block1 <= args.video_stop;
+    size_t row = ((size_t)h * args.nqb + i) * args.nqb;
+    if (!intersects || args.video_last <= args.video_first) {
+        thresholds[(size_t)h * args.nqb + i] = 1.0e30f; return;
+    }
+    float mean = 0.0f, var = 0.0f;
+    uint count = args.video_last - args.video_first;
+    for (uint pass = 0u; pass < 2u; pass++) {
+        float sum = 0.0f, sum2 = 0.0f;
+        for (uint j = args.video_first; j < args.video_last; j++) {
+            size_t ck = ((size_t)h * args.nqb + j) * 128u;
+            float dot = 0.0f;
+            for (uint d = 0u; d < 128u; d++)
+                dot = fma(h3_bf16_to_f32(pooled[cq + d]),
+                          h3_bf16_to_f32(pooled[ck + d]), dot);
+            dot *= args.scale;
+            if (pass == 1u) scores[row + j] = dot;
+            sum += dot; sum2 += dot * dot;
+        }
+        mean = sum / (float)count;
+        var = max(sum2 / (float)count - mean * mean, 0.0f);
+    }
+    thresholds[(size_t)h * args.nqb + i] = fully ? mean + args.tau * sqrt(var)
+                                                  : 1.0e30f;
+}
+
+kernel void h3_sol_block_select_bf16(
+        device const float *scores [[buffer(0)]],
+        device const float *thresholds [[buffer(1)]],
+        device uint *sel_offsets [[buffer(2)]],
+        device uint *sel_indices [[buffer(3)]],
+        constant sol_scores_args &args [[buffer(4)]],
+        uint h [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint threads [[threads_per_threadgroup]]) {
+    /* One threadgroup per head; grid.x == heads. Row counts are computed
+     * in parallel, then thread 0 performs the (short) serial prefix sum;
+     * index lists are written by row threads in ascending block order. */
+    uint nqb = args.nqb;
+    float threshold = 1.0e30f;
+    size_t row = 0u;
+    if (h < args.heads) {
+        for (uint i = tid; i < nqb; i += threads) {
+            threshold = thresholds[(size_t)h * nqb + i];
+            row = ((size_t)h * nqb + i) * nqb;
+            uint c = 0u;
+            for (uint j = args.video_first; j < args.video_last; j++)
+                if (scores[row + j] > threshold) c++;
+            sel_offsets[(size_t)h * (nqb + 1u) + i + 1u] = c;  /* counts first */
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (h >= args.heads) return;
+    if (tid == 0u) {
+        uint running = 0u;
+        for (uint i = 0u; i < nqb; i++) {
+            uint c = sel_offsets[(size_t)h * (nqb + 1u) + i + 1u];
+            sel_offsets[(size_t)h * (nqb + 1u) + i] = running;
+            running += c;
+        }
+        sel_offsets[(size_t)h * (nqb + 1u) + nqb] = running;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < nqb; i += threads) {
+        threshold = thresholds[(size_t)h * nqb + i];
+        row = ((size_t)h * nqb + i) * nqb;
+        uint slot = sel_offsets[(size_t)h * (nqb + 1u) + i];
+        for (uint j = args.video_first; j < args.video_last; j++)
+            if (scores[row + j] > threshold) {
+                sel_indices[((size_t)h * nqb + i) * nqb + slot] = j;
+                slot++;
+            }
+    }
+}
+
+struct sol_attn_args { uint sequence, heads, block, nqb, video_start, video_stop, video_first, video_last; float scale; };
+kernel void h3_sol_attn_bf16(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        constant sol_attn_args &args [[buffer(4)]],
+        device const ushort *pooled [[buffer(5)]],
+        device const float *scores [[buffer(6)]],
+        device const uint *sel_offsets [[buffer(7)]],
+        device const uint *sel_indices [[buffer(8)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint2 tid [[thread_position_in_threadgroup]]) {
+    uint i = group.x, h = group.y;
+    uint row = i * args.block + tid.x;
+    if (row >= args.sequence) return;
+    uint nqb = args.nqb;
+    bool target = row >= args.video_start && row < args.video_stop;
+    size_t qbase = ((size_t)row * args.heads + h) * 128u;
+    device const ushort *qrow = query + qbase;
+    float acc[128];
+    float keyscores[64];
+    float m = -INFINITY, l = 0.0f;
+    for (uint d = 0u; d < 128u; d++) acc[d] = 0.0f;
+
+    for (uint j = 0u; j < nqb; j++) {
+        bool video_block = j >= args.video_first && j < args.video_last;
+        bool exact;
+        if (!target) exact = true;            /* prefix rows: full exact */
+        else if (!video_block) exact = true;  /* prefix KV sink */
+        else {
+            /* selected via binary search over this row block's list */
+            uint base = sel_offsets[(size_t)h * (nqb + 1u) + i];
+            uint end = sel_offsets[(size_t)h * (nqb + 1u) + i + 1u];
+            exact = false;
+            uint lo = base, hi = end;
+            while (lo < hi) {
+                uint mid = (lo + hi) / 2u;
+                uint v = sel_indices[((size_t)h * nqb + i) * nqb + mid];
+                if (v == j) { exact = true; break; }
+                if (v < j) lo = mid + 1u; else hi = mid;
+            }
+        }
+        if (!exact) {
+            /* pooled compensation with the block score */
+            float s = scores[((size_t)h * nqb + i) * nqb + j];
+            float newm = fmax(m, s), em = exp(m - newm);
+            float p = exp(s - newm);
+            l = fma(l, em, p); m = newm;
+            size_t cv = ((size_t)2u * args.heads + h) * nqb * 128u +
+                        (size_t)j * 128u;
+            for (uint d = 0u; d < 128u; d++)
+                acc[d] = fma(p, h3_bf16_to_f32(pooled[cv + d]), acc[d] * em);
+            continue;
+        }
+        uint k0 = j * args.block, k1 = min(k0 + args.block, args.sequence);
+        for (uint kc = k0; kc < k1; kc += 64u) {
+            uint kn = min(64u, k1 - kc);
+            float newm = m;
+            for (uint t = 0u; t < kn; t++) {
+                device const ushort *krow = key +
+                    ((size_t)(kc + t) * args.heads + h) * 128u;
+                float dot = 0.0f;
+                for (uint d = 0u; d < 128u; d++)
+                    dot = fma(h3_bf16_to_f32(qrow[d]),
+                              h3_bf16_to_f32(krow[d]), dot);
+                dot *= args.scale;
+                keyscores[t] = dot;
+                newm = fmax(newm, dot);
+            }
+            float em = exp(m - newm);
+            float lsum = 0.0f;
+            for (uint t = 0u; t < kn; t++) {
+                float p = exp(keyscores[t] - newm);
+                keyscores[t] = p;
+                lsum += p;
+            }
+            l = fma(l, em, lsum); m = newm;
+            for (uint d = 0u; d < 128u; d++) {
+                float o = acc[d] * em;
+                for (uint t = 0u; t < kn; t++)
+                    o = fma(keyscores[t], h3_bf16_to_f32(
+                        value[((size_t)(kc + t) * args.heads + h) * 128u + d]),
+                        o);
+                acc[d] = o;
+            }
+        }
+    }
+    float inv = 1.0f / l;
+    for (uint d = 0u; d < 128u; d++)
+        output[qbase + d] = h3_f32_to_bf16(acc[d] * inv);
 }

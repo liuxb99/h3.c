@@ -1,0 +1,33 @@
+{
+  "asset_id": "h3c_engine_convrot_patched",
+  "role": "h3c_native_engine_production_weights",
+  "compatible_engines": [
+    "h3c_native_metal (model_native / model_native_v2 via symlink)"
+  ],
+  "layout_contract": {
+    "main_block_fused_qkv_i8": "grouped_rows_engine_rowmap",
+    "token_refiner_qkv_passthrough": "interleaved_per_head_triples",
+    "passthrough_bf16": "HF_canonical_bytes_verbatim"
+  },
+  "quant_method": "int8_convrot (I8 tensors unchanged from official); 279 pass-through bf16 tensors replaced by HF-golden bytes (no dequant/requant roundtrip)",
+  "assets": [
+    {
+      "name": "convrot_engine_patched",
+      "path": "/Volumes/SSD2T/models/MiniMax-H3-h3c-engine/convrot_engine_patched.safetensors",
+      "expected_sha256": "aa0af27c33ee42ff48e50ba70ce03eefed72b4166e755df3fa63687892b28994",
+      "size_bytes": 34038894550,
+      "read_only": false,
+      "passthrough_manifest": "/Users/cyliu99/AI/h3c_mac_20261125/h3c/scratch/sol/engine_backup_prepatch/manifest.json",
+      "hf_source_dir": "/Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3-flex-ref2va/Ref2VA/transformer",
+      "release_reference_dir": "/Volumes/SSD2T/models/MiniMax-H3-comfy-int8",
+      "passthrough_expected_deviation": "279 pass-through regions carry HF-golden bytes (interleaved qkv + bf16 verbatim); frozen official release keeps legacy grouped/279-divergent bytes (release_disambig_verdict CLASS=MIXED, 2026-11-28) — deviation vs release reference is BY DESIGN"
+    }
+  ],
+  "lineage": {
+    "parent_asset": "/Volumes/SSD2T/models/MiniMax-H3-comfy-int8/minimax_h3_ref2va_int8_convrot.safetensors @ 9eef934046a0671bc8a5daf87100705e1478419c574cfde70c50fbe6885f76a9 (official, pre-patch)",
+    "patch_set": "279 pass-through regions from HF golden via scratch/sol/apply patch + revert manifest engine_backup_prepatch/manifest.json; post-patch byte-verify ok=279 bad=0 total=279",
+    "converter": "manual 2026-11-27 patch (provisional) — to be superseded by scripts/build_int8_convrot.py (h3c-built) after validation"
+  },
+  "known_defects": [],
+  "recorded_at": "2026-11-28T01:30:00+08:00"
+}
