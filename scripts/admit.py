@@ -238,8 +238,8 @@ def request(args):
                         s, policy, 5)
 
     ev = {"event": "admit", "run_id": args.run_id, "cls": cls, "pid": os.getppid(),
-          "ts": s["ts"], "_ts_epoch": time.time(), "reason": args.reason or "",
-          "snapshot": s}
+          "est_gb": c["est_gb"], "ts": s["ts"], "_ts_epoch": time.time(),
+          "reason": args.reason or "", "snapshot": s}
     append(ev)
     print(json.dumps({"verdict": "ADMIT", "run_id": args.run_id, "cls": cls,
                       "snapshot_summary": {k: s[k] for k in
@@ -296,6 +296,19 @@ def watch(args):
                 rate = swap_rate(policy)
                 if rate is not None and rate > policy["swap_rate_block_gb_per_min"]:
                     alert = f"swap {s['swap_used_gb']}G growing {rate}G/min"
+            if not alert:
+                # overspend: registered run exceeding its admitted estimate
+                for rid, r in read_registry().items():
+                    est, pid = r.get("est_gb"), r.get("pid")
+                    if not est or not pid:
+                        continue
+                    try:
+                        rss = int(sh(["ps", "-o", "rss=", "-p", str(pid)]).strip() or 0) / 2**20
+                    except Exception:
+                        continue
+                    if rss > 1.3 * est:
+                        alert = f"overspend {rid} ({r.get('cls')}): rss {rss:.1f}G > est {est}G"
+                        break
             if alert and alerts < 20:
                 print(f"ALERT {s['ts']} {alert}", flush=True)
                 alerts += 1

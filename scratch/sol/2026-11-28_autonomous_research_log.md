@@ -128,3 +128,11 @@
 **R1 結帳（ACTION）**：.ready marker＋freeze（chmod a-w）＋manifest v2（含 gate rerun3、負向矩陣、oracle 待補、雙跑 repro、sha256 dd098ba9…ffeeb）寫入 /Volumes/SSD2T/models/MiniMax-H3-h3c-built/。獨立 oracle 子代理（不 import builder/gate 函數、流式全 250 重驗）仍在跑，結果作補充證據非阻斷項。
 
 **下一步（R2）**：h3.c 原生引擎對 h3c-built 資產的實載契約與 smoke——重型 GPU 步驟一律先過 scripts/admit.py 准入（當前 swap 20.6G/compressor 16.5G 高於政策帶，heavy_gpu 現行會被 DENY，等子代理收尾＋壓力回落）；不動 ComfyX/Strata。
+
+### 2026-11-28 12:0x tick（R2 實載契約建立：loader/probe/--info 三口徑全對等，GPU 待准入）
+
+- **FACT**：`h3_native_loader_tests <built>` shards=2、253 checks fails=0，輸出與 official 同構；`probe_sidecar`（ argv 化＋補 qkv/adaln 鍵）built vs official 逐 key 一致（I8、convrot=1、gs256、adaln gs64；token_refiner 兩側皆由 FL2VA bf16 副本優先解析 = 引擎既有行為）；`h3 --info` 兩目錄資產清單 diff 空。TE symlink（qwen3vl nvfp4）復用官方原件補齊 single-file 佈局。契約檔 evidence/convrot_audit_20261128/r2_asset_contract.md。
+- **修復**：probe_sidecar 連結失敗根因 = 隱式規則經 .d 檔把 SDKSettings.json 拖進 $^（clang 多輸出 -o 衝突）；Makefile 加 .o-only 顯式規則永久修復。admit.py watch 補 overspend 偵測（註冊 est_gb vs 實際 RSS >1.3x → ALERT）＋request 事件補 est_gb 欄；watch 常駐重啟（先前 nohup 因寫錯目錄靜默死亡，教訓：啟動後必驗 monitor.jsonl 有新行）。oracle 補登記（heavy_io est 28G，實測 26G；其 pid 91901 早於准入制度上線）。
+- **FACT（oracle 進度）**：獨立重驗 146/250 全 pass、within1=1.000000、relmax<4e-3、layout 正確——與 gate 交叉印證至 block 35。
+- **INFERENCE**：swap 20.5G 平台 + compressor 7.9→11G 震盪主因疑似 oracle 26G 常駐＋舊 panic 殘留；其收尾後預期回落。
+- **下一步**：oracle 收尾＋壓力回落 → admit heavy_gpu → 引擎 192×192/22f/2-step smoke → R3 condition_proj NaN 回歸＋逐 tap golden 對拍。GPU 未准入前不強推。

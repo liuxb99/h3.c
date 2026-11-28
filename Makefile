@@ -227,3 +227,8 @@ clean:
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 \
 	libh3.a *.o *.d tests/*.o tests/*.d
+
+# Explicit rule: implicit rule pulled SDKSettings.json + headers into $^ via
+# the generated .d file, breaking the link (2026-11-28). Keep prerequisites .o-only.
+probe_sidecar: probe_sidecar.o h3_weights.o h3_safetensors.o h3_gpu.o
+	$(CC) -o $@ $^ $(LDLIBS)
