@@ -136,3 +136,11 @@
 - **FACT（oracle 進度）**：獨立重驗 146/250 全 pass、within1=1.000000、relmax<4e-3、layout 正確——與 gate 交叉印證至 block 35。
 - **INFERENCE**：swap 20.5G 平台 + compressor 7.9→11G 震盪主因疑似 oracle 26G 常駐＋舊 panic 殘留；其收尾後預期回落。
 - **下一步**：oracle 收尾＋壓力回落 → admit heavy_gpu → 引擎 192×192/22f/2-step smoke → R3 condition_proj NaN 回歸＋逐 tap golden 對拍。GPU 未准入前不強推。
+
+### 2026-11-28 13:3x tick（oracle PASS 閉環＋swap 佔用者查明＋GPU smoke 排程決策）
+
+- **FACT（R1 證據閉環）**：獨立 oracle 子代理完成：250/250 PASS、codes within1 最低 1.0（max|Δ|=1，exact 最低 0.9215）、scale relmax 3.89e-3、zero-init 帶（blocks.49.adaln_proj row 43008–64511，21504 行，scale==1e-30/codes==0）0 違反、QKV kind-grouped 實證（identity 假設 within1≤0.037 被拒）、passthrough 285/285 byte-identical；純 numpy+stdlib 零 import scripts/，峰值 RSS 3.96G。oracle_verdict.json 已入 evidence/＋manifest v3（重新凍結）。負向矩陣冪等三跑全過、GAP=0。
+- **FACT（swap 高原查明）**：13:3x 時 swap 20.4G 高原、compressor ~10G 之佔用者 = 正在跑的 chain gate 序列（pid 34229 official_vs_hf gate，RSS 29G，nice 10）＋ Strata 常駐 52G。非幽靈洩漏；系 Nice 前 oracle/chain 記憶已釋放（oracle RSS 27→16→0 全程可觀察）。chain 依序 official_vs_hf→compare_bytes_v2→engine_vs_hf(curgate)。
+- **INFERENCE**：macOS 對已退出程序的 swap 釋放緩慢，20G 高原屬 lazy reclaim，非進行式洩漏。
+- **INFRA GAP（待修，非阻斷）**：chain 由子代理啟動未经 admit 登記（watch overspend 偵測對其無效）——R7 執行面缺口，後續以 wrapper 強制（run_and_record 內嵌 admit request/release）。另 gate triage 標籤不準（M1 排列錯被標 QUANT_DRIFT、M2 scale 錯被標 PERMUTATION；拒收判定本身正確）＋ scripts/st_io.py st_create NameError——列入 R3 前置小修。
+- **DECISION**：GPU smoke 不在 chain gate 期間強推（heavy 互斥政策）；待 chain 收尾＋准入通過後跑 192×192/22f/2-step（h3 -d built -p ... --frames 22 --steps 2 --seed ...，命令語法已確認）。Strata/ComfyX 全程未動。
