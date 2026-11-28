@@ -148,22 +148,34 @@ class WeightSource:
         fn, e, ds = self.ent(name)
         mm = self.files[fn][2]
         a, b = e["data_offsets"]
-        return np.frombuffer(mm, dtype=np.int8, count=b - a, offset=ds + a)
+        return np.frombuffer(mm, dtype=np.int8, count=b - a, offset=ds + a).copy()
+
+    def sidecar_key(self, subj, kind):
+        # Two shipped spellings, both must resolve (2026-11-28 measured,
+        # sidecar_keys_probe.py): OFFICIAL/engine assets use the strip form
+        #   "X.weight" -> "X.weight_scale" / "X.comfy_quant";
+        # the 2026-11-28 h3c-built refactor uses the append form
+        #   "X.weight" -> "X.weight.weight_scale" / "X.weight.comfy_quant".
+        # Production loader convention (official + engine) is the strip form.
+        if kind == "scale":
+            cands = [subj + "_scale", subj + ".weight_scale"]
+        else:
+            base = subj[: -len(".weight")] if subj.endswith(".weight") else subj
+            cands = [base + ".comfy_quant", subj + ".comfy_quant"]
+        for c in cands:
+            if c in self.key_file:
+                return c
+        return cands[0]  # absent; ent() raises KeyError with the expected key
 
     def scale_f32(self, name):
-        # Official verbatim sidecar convention: sidecar = full subject key
-        # + suffix ("X.weight" -> "X.weight.weight_scale" / ".comfy_quant").
-        # 2026-11-28: gate previously stripped ".weight" first, matching the
-        # old draft convention; the shipped official/built file uses the
-        # append form (pinned from the built header: 250/250 keys).
-        fn, e, ds = self.ent(name + ".weight_scale")
+        fn, e, ds = self.ent(self.sidecar_key(name, "scale"))
         mm = self.files[fn][2]
         a, b = e["data_offsets"]
         return np.frombuffer(mm, dtype=np.float32,
                              count=(b - a) // 4, offset=ds + a).reshape(-1, 1).copy()
 
     def groupsize(self, name):
-        fn, e, ds = self.ent(name + ".comfy_quant")
+        fn, e, ds = self.ent(self.sidecar_key(name, "comfy"))
         mm = self.files[fn][2]
         cj = json.loads(payload(mm, ds, e))
         return int(cj["convrot_groupsize"]), cj
@@ -236,7 +248,10 @@ def main():
             sidecar.add(k)
     for k in sorted(keys):
         if k.endswith(".comfy_quant"):
-            subj = k[: -len(".comfy_quant")]  # full subject key (e.g. X.weight)
+            base = k[: -len(".comfy_quant")]
+            # official spelling: base lacks ".weight" (X.comfy_quant);
+            # 2026-11-28 built spelling: base already is X.weight.
+            subj = base if base.endswith(".weight") else base + ".weight"
             quant_subs[subj] = cand.groupsize(subj)[0]
     pt_keys = sorted(k for k in keys if k not in quant_subs and k not in sidecar)
     log(f"candidate: {len(quant_subs)} quantized subjects, {len(pt_keys)} pass-through keys, "

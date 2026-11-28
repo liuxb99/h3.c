@@ -14,3 +14,7 @@ scratch/sol/*
 build/
 libh3.a
 h3_dit_bench_*
+scratch/sol/engine_backup_prepatch/
+scratch/sol/_unused.py
+err*.log
+__pycache__/

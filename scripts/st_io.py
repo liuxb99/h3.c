@@ -140,5 +140,12 @@ def st_create(path, tensors, metadata=None, align=64):
 
 
 def st_close(mm, f):
-    mm.close()
+    try:
+        mm.close()
+    except BufferError:
+        # numpy views (from np.frombuffer without .copy) still pin the mapping.
+        # The mapping is released when the last view dies (GC); keeping it open
+        # past process teardown used to crash gate runs AFTER the verdict was
+        # already written (rc=1 with GATE_EXIT=0, 2026-11-28 root-caused).
+        pass
     f.close()
