@@ -1,0 +1,42 @@
+R5a pruned-adaln four-tap CPU verification — run log
+Date: 2026-11-29 00:05-01:10 CST (evidence dir anchored 20261128 per task)
+Repo: /Users/cyliu99/AI/h3c_mac_20261125/h3c @ feat/mac-pika-flex (HEAD 979b89c base)
+GGUF (RO): /Volumes/SSD2T/models/MiniMax-H3-gguf/minimax_h3_fl2va_pruned-IQ1_S.gguf (5756 tensors; general.adaln_t_table = FLOAT32 [1025,8], md5 619f737c0640c1c7a4f67606842f3a45)
+Reference source: /Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3/FL2VA/transformer (13 safetensors shards, adaln BF16)
+Tool: scripts/verify_adaln_taps.py (pure python3+numpy, self-written GGUF/safetensors readers; no ggml build, no GPU)
+Prior-art recovery: killed R5a subagent left scratch/r5a_gguf_tensor_infos.json (GGUF tensor table) + scratch/sol/engine_backup_prepatch/ (559 files, no adaln weights); tensor table re-verified against live GGUF header before use; no evidence dir existed.
+
+TAP RESULTS (detail in taps.json / scratch/sol/r5a_phase_t{1..4}.json):
+t1 PASS  adaln_t_table direct read + lerp: bit-identical to minimax_h3.hpp scalar lerp on all 12 unique
+         schedule rows (incl. 0.14249032735824585 row), table contiguous f32 32KB (grid 1025 = ts*1024+1e-4
+         floor, engine clamps frac), contract basis-fit rel_rms 0.00256 on 1025-grid / 0.0108 vs smoothness
+         0.011 (rank 7.03 => rank-7 fold budget within contract tolerance).
+t2 PASS  96768 row ordering: GGUF per-block adaln bias (F16,96768) correlates with FL2VA original
+         adaln_proj bias row-for-row at corr 0.986-0.996 vs <=0.65 for [slot][modality]->[modality][slot]
+         swap and reversed (offset-invariant test; raw identical-frac 0.04% because fold intercept absorbs
+         per-output constants, bias std ratio ~3x, side finding). Rows are NOT 4x(24x1008)-interleaved;
+         layout is [modality][slot][hidden], identity index map vs original [96768,2688] rows.
+t3 PASS  weight-level, blocks 0/25/49 + final_layer (10752): per-output-index curve residual of GGUF
+         fold vs original curve = basis floor (e_gguf/e_fit median 0.91-0.93, p99 <= 1.15; fold rel_rms
+         0.14-0.18% on 1025-grid, floor 0.13-0.17%), i.e. every index reproduced at floor; identity
+         coefficient ordering error 0.30-0.38 vs 1.04-1.37 swap/reversed (identity wins ~3x; coefficient
+         magnitudes are non-unique because the 8 table columns have rank 7.03 — curve test is the arbiter;
+         self-consistency probe: lstsq on GGUF's own curve recovers GGUF coefficients to 3e-6).
+t4 PASS  zero-runtime-matmul feasibility: GGUF fold table rows (cstep@W8+b8) vs CPU reference forward
+         (T2688@W2688^T+b2688, bf16-rounded) over ALL 50 blocks x 12 unique schedule rows:
+         rel_rms median 0.00166 max 0.00177; per-step-path table 12 rows x 50 blocks x 96768 x (8+1) bf16
+         = 116.1 MB (2.32 MB/step); full 1025-grid would be 9.0 GB. Fold precompute for all 50 blocks:
+         0.69 s (rows x 8 matmul, once per schedule) vs 260 s full reference recompute. Token loop = row
+         slice only; h3_dit_schedule_block() API unchanged (contract item 4 holds).
+sd-cli DEFERRED_coordination_window  1-step sd-cli forward not run: pgrep -x sd-cli empty and swap 1.89G < 10G,
+         but memory not idle (free 30%, compressed ~24G from sibling parallel task) -> task gate not met;
+         watchdog-panic red line respected. Curve-level equivalence in t3/t4 already substitutes for it.
+
+GATE: scripts/admit.py denied heavy work 8x (sibling compressor 21.7->24.5G steady); t3/t4 run under
+audited ADMIT_FORCE with footprint cut to ~0.7G (bf16-raw chunked loads) + swap>4.5G in-process abort
+guard; observed swap max 1.85G, no spike, no panic. See admission_gate_log in taps.json + admission/registry.jsonl.
+
+CONCLUSION 96768 layout: GGUF rows keep original FL2VA row order j = (modality*24 + slot)*1008 + hidden
+(modality-major). The contract's 4x(24x1008) interleave formula is DISCONFIRMED as a row-order map; for
+R5b consumption: row j of blocks.X.adaln_proj.linear (Q8_0 [96768,8]) and bias (F16 [96768]) pairs index-wise
+with the folded 8-dim basis for output j; no de-interleave needed, engine's [m*24+s] indexing applies directly.

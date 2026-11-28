@@ -1,0 +1,645 @@
+{
+ "t1_gguf_table_lerp_vs_contract": {
+  "tap": "t1_adaln_t_table",
+  "oracle": "minimax_h3.hpp:1070-1090 curve lerp (get_rows+mul+add,f32); pruned path hpp uses_adaln_curves ctor",
+  "table_structural": {
+   "dims": [
+    8,
+    1025
+   ],
+   "type": 0,
+   "offset": 0,
+   "region_bytes": 32800,
+   "first_nonzero_offset_after": 32800,
+   "offset0_and_contiguous": true
+  },
+  "grid": 1025,
+  "table_rows": 1025,
+  "table_cols": 8,
+  "lerp_formula": "pos=clamp(t,0,1)*(1024); i=min(floor(pos),1023); frac=pos-i; c=(1-frac)*T[i]+frac*T[i+1]",
+  "smoothness_second_to_first_diff_rms": 0.010848598554730415,
+  "basis_fit_vs_engine_t2688": {
+   "grid_rel_rms": 0.002562404377385974,
+   "step_rows_rel_rms": 0.002659726422280073,
+   "note": "intrinsic 8-dim curve-fold error budget at engine semantics (bf16 included)"
+  },
+  "timestep_map": "engine t=1-sigma (h3_dit_schedule.c:147-148, h3_host.c:129-133 shift 12/3) == sd.cpp layout.timesteps [0,1] scale (VISUAL_COND 0.999/audio 1.0 constants match hpp:23,787-788)",
+  "steps_used": 6,
+  "unique_step_ts": [
+   0.0,
+   0.016316115856170654,
+   0.03994244337081909,
+   0.06221896409988403,
+   0.07692307233810425,
+   0.14249032735824585,
+   0.14267361164093018,
+   0.25,
+   0.2936199903488159,
+   0.3992806077003479,
+   0.6244378089904785,
+   0.9990000128746033
+  ],
+  "hpp_scalar_loop_bit_identical": true,
+  "golden_lerp_rows": [
+   {
+    "t": 0.0,
+    "position": 0.0,
+    "index": 0,
+    "frac": 0.0,
+    "coef8": [
+     0.46788281202316284,
+     0.248228520154953,
+     -0.09162993729114532,
+     0.034378983080387115,
+     0.007069366052746773,
+     -0.0013603972038254142,
+     -0.0005915956571698189,
+     0.0003798087127506733
+    ]
+   },
+   {
+    "t": 0.016316115856170654,
+    "position": 16.70770263671875,
+    "index": 16,
+    "frac": 0.70770263671875,
+    "coef8": [
+     0.428152471780777,
+     0.2016613632440567,
+     -0.04897905886173248,
+     0.023273032158613205,
+     0.002063667867332697,
+     -0.00016446322842966765,
+     0.00011736570741049945,
+     -3.066769932047464e-05
+    ]
+   },
+   {
+    "t": 0.03994244337081909,
+    "position": 40.90106201171875,
+    "index": 40,
+    "frac": 0.90106201171875,
+    "coef8": [
+     0.37911179661750793,
+     0.14392513036727905,
+     -0.006887428462505341,
+     0.009769049473106861,
+     -0.0017948215827345848,
+     0.000536300940439105,
+     0.00017860297521110624,
+     -0.00015359054668806493
+    ]
+   },
+   {
+    "t": 0.06221896409988403,
+    "position": 63.71221923828125,
+    "index": 63,
+    "frac": 0.71221923828125,
+    "coef8": [
+     0.3409629166126251,
+     0.10028206557035446,
+     0.01652921363711357,
+     3.288181687821634e-05,
+     -0.003034464782103896,
+     0.0005589728243649006,
+     1.4370933968166355e-05,
+     -7.768582145217806e-05
+    ]
+   },
+   {
+    "t": 0.07692307233810425,
+    "position": 78.76922607421875,
+    "index": 78,
+    "frac": 0.76922607421875,
+    "coef8": [
+     0.3193512558937073,
+     0.0765594020485878,
+     0.025767486542463303,
+     -0.004896495491266251,
+     -0.0030736392363905907,
+     0.00041346673970110714,
+     -7.02976030879654e-05,
+     -1.08050089693279e-05
+    ]
+   },
+   {
+    "t": 0.14249032735824585,
+    "position": 145.91009521484375,
+    "index": 145,
+    "frac": 0.91009521484375,
+    "coef8": [
+     0.24638089537620544,
+     0.00588915403932333,
+     0.03363894298672676,
+     -0.015711471438407898,
+     -0.0004961828235536814,
+     -0.00037090055411681533,
+     -6.954681157367304e-05,
+     9.873938688542694e-05
+    ]
+   },
+   {
+    "t": 0.14267361164093018,
+    "position": 146.0977783203125,
+    "index": 146,
+    "frac": 0.0977783203125,
+    "coef8": [
+     0.24621443450450897,
+     0.005750246345996857,
+     0.033616531640291214,
+     -0.015722252428531647,
+     -0.00048777126357890666,
+     -0.0003722714027389884,
+     -6.909242802066728e-05,
+     9.861559374257922e-05
+    ]
+   },
+   {
+    "t": 0.25,
+    "position": 256.0,
+    "index": 256,
+    "frac": 0.0,
+    "coef8": [
+     0.16578277945518494,
+     -0.045993730425834656,
+     0.008798128925263882,
+     -0.01279502548277378,
+     0.002142263576388359,
+     -0.000231998972594738,
+     9.248405694961548e-05,
+     -5.2554067224264145e-05
+    ]
+   },
+   {
+    "t": 0.2936199903488159,
+    "position": 300.6668701171875,
+    "index": 300,
+    "frac": 0.6668701171875,
+    "coef8": [
+     0.13845907151699066,
+     -0.05634358152747154,
+     -0.0017951976042240858,
+     -0.009104793891310692,
+     0.0019448306411504745,
+     8.965319284470752e-05,
+     5.8037803682964295e-05,
+     -7.146093412302434e-05
+    ]
+   },
+   {
+    "t": 0.3992806077003479,
+    "position": 408.86334228515625,
+    "index": 408,
+    "frac": 0.86334228515625,
+    "coef8": [
+     0.07646149396896362,
+     -0.06648220866918564,
+     -0.018911302089691162,
+     -3.0684703233418986e-05,
+     0.0003047424543183297,
+     0.0005733217112720013,
+     -7.507873669965193e-05,
+     -1.1039966011594515e-05
+    ]
+   },
+   {
+    "t": 0.6244378089904785,
+    "position": 639.42431640625,
+    "index": 639,
+    "frac": 0.42431640625,
+    "coef8": [
+     -0.0722821056842804,
+     -0.03601999580860138,
+     -0.009696220979094505,
+     0.0116434246301651,
+     -0.0012566104996949434,
+     -0.000449472718173638,
+     9.645566751714796e-05,
+     2.574844802438747e-05
+    ]
+   },
+   {
+    "t": 0.9990000128746033,
+    "position": 1022.9760131835938,
+    "index": 1022,
+    "frac": 0.97601318359375,
+    "coef8": [
+     -0.40145546197891235,
+     0.08631380647420883,
+     -0.08045659959316254,
+     -0.06712324917316437,
+     -0.0026127346791327,
+     -0.0013807701179757714,
+     -0.0007743065361864865,
+     -0.00025118605117313564
+    ]
+   }
+  ],
+  "verdict": "PASS",
+  "elapsed_s": 0.09
+ },
+ "t2_perblock_row_order_vs_contract": {
+  "tap": "t2_adaln_row_layout",
+  "fact_sources": [
+   "h3_dit_schedule.h:12,14,15 HIDDEN=5376 MODALITIES=3 ADALN_SLOTS=6",
+   "h3_dit_schedule.c:12 BLOCK_OUTPUT = MODALITIES*ADALN_SLOTS*HIDDEN",
+   "h3_dit_schedule.c:406-410 base=(row*M*S + m*S + s)*HIDDEN",
+   "minimax_h3.hpp AdaLayerNormModulation::modulation_row: reshape_2d(hidden*expand, rows*modalities)+chunk"
+  ],
+  "conclusion_layout": "96768 = MODALITIES(3) x SLOTS(6) x HIDDEN(5376), modality-outer, slot-middle, hidden-inner; per timestep row.",
+  "alt_factorizations": "4x(24x1008) and 2688x(6x6) equal 96768 numerically but do NOT match the engine/sd.cpp consumption index formulas (checked per sampled j): they are arithmetic coincidences, not the layout.",
+  "layout_decomposition_sample": [
+   {
+    "j": 0,
+    "engine_msh": [
+     0,
+     0,
+     0
+    ],
+    "alt_slotmod_msh": [
+     0,
+     0,
+     0
+    ]
+   },
+   {
+    "j": 1,
+    "engine_msh": [
+     0,
+     0,
+     1
+    ],
+    "alt_slotmod_msh": [
+     0,
+     0,
+     1
+    ]
+   },
+   {
+    "j": 5375,
+    "engine_msh": [
+     0,
+     0,
+     5375
+    ],
+    "alt_slotmod_msh": [
+     0,
+     0,
+     5375
+    ]
+   },
+   {
+    "j": 5376,
+    "engine_msh": [
+     0,
+     1,
+     0
+    ],
+    "alt_slotmod_msh": [
+     1,
+     0,
+     0
+    ]
+   },
+   {
+    "j": 32255,
+    "engine_msh": [
+     0,
+     5,
+     5375
+    ],
+    "alt_slotmod_msh": [
+     2,
+     1,
+     5375
+    ]
+   },
+   {
+    "j": 32256,
+    "engine_msh": [
+     1,
+     0,
+     0
+    ],
+    "alt_slotmod_msh": [
+     0,
+     2,
+     0
+    ]
+   },
+   {
+    "j": 96767,
+    "engine_msh": [
+     2,
+     5,
+     5375
+    ],
+    "alt_slotmod_msh": [
+     2,
+     5,
+     5375
+    ]
+   }
+  ],
+  "engine_formula_selfcheck": true,
+  "blocks_checked": [
+   {
+    "block": 0,
+    "bias_max_abs_diff": 2.07421875,
+    "bias_identical_within_f16_ulp_frac": 0.0007750496031746031,
+    "bias_identical_frac_under_slotmodality_swap": 0.00042369378306878305,
+    "bias_corr_identity": 0.988282322883606,
+    "bias_corr_slotmodality_swap": -0.17079688608646393,
+    "bias_corr_reversed": 0.6556706428527832,
+    "bias_mean_std_gguf": [
+     -0.205028235912323,
+     0.41489630937576294
+    ],
+    "bias_mean_std_orig": [
+     -0.06809931248426437,
+     0.1396532654762268
+    ],
+    "weight_shape_ggml": [
+     8,
+     96768
+    ]
+   },
+   {
+    "block": 25,
+    "bias_max_abs_diff": 4.85546875,
+    "bias_identical_within_f16_ulp_frac": 0.00042369378306878305,
+    "bias_identical_frac_under_slotmodality_swap": 0.0005373677248677248,
+    "bias_corr_identity": 0.9854958653450012,
+    "bias_corr_slotmodality_swap": -0.02521832473576069,
+    "bias_corr_reversed": -0.13461783528327942,
+    "bias_mean_std_gguf": [
+     -0.0019583601970225573,
+     0.38368868827819824
+    ],
+    "bias_mean_std_orig": [
+     -0.0009457459673285484,
+     0.12713396549224854
+    ],
+    "weight_shape_ggml": [
+     8,
+     96768
+    ]
+   },
+   {
+    "block": 49,
+    "bias_max_abs_diff": 10.734375,
+    "bias_identical_within_f16_ulp_frac": 0.22234623015873015,
+    "bias_identical_frac_under_slotmodality_swap": 0.055999917328042326,
+    "bias_corr_identity": 0.9959912300109863,
+    "bias_corr_slotmodality_swap": 0.000987365492619574,
+    "bias_corr_reversed": 0.008828854188323021,
+    "bias_mean_std_gguf": [
+     0.20703044533729553,
+     1.7221174240112305
+    ],
+    "bias_mean_std_orig": [
+     0.06711684167385101,
+     0.5726338028907776
+    ],
+    "weight_shape_ggml": [
+     8,
+     96768
+    ]
+   }
+  ],
+  "verdict": "PASS",
+  "elapsed_s": 0.02,
+  "bias_fingerprint": {
+   "identical_within_ulp_frac_min": 0.00042369378306878305,
+   "corr_identity_min": 0.9854958653450012,
+   "corr_alt_permutation_max": 0.6556706428527832,
+   "note": "low identical-frac + corr_identity~1 means fold moved a per-output constant into the 8-dim basis intercept; ordering is still testable by correlation, which is offset-invariant"
+  },
+  "side_finding_bias_transform": "gguf fold bias is not a plain copy/offset of original bias: std ratio ~3x (consistent with fold intercept b8 = b2688 + W2688@mu_emb + quantization); ordering conclusion is unaffected (correlation test is offset-invariant and separates identity from all tested permutations by >0.15)"
+ },
+ "t3_weight_level_perindex_3blocks": {
+  "tap": "t3_weight_level_perindex",
+  "method": "per-output-index lstsq fit of original [1025-grid mod curve] onto [table|1] design; compare fitted (W8,b8) per index with GGUF rows; permutation hypotheses identity vs [slot][modality] vs reversed",
+  "blocks": [
+   {
+    "block": 0,
+    "coef_err_identity_med": 0.2993195950984955,
+    "coef_err_identity_p99": 1.3305342197418213,
+    "coef_err_slotmodality_swap_med": 1.2339084148406982,
+    "coef_err_reversed_med": 1.2509474754333496,
+    "per_j_mod_resid_gguf_over_fit_rms": {
+     "median": 0.925750732421875,
+     "p99": 1.1468009948730469
+    },
+    "group_ratio_spread_modslot_mean_max/min": [
+     1.005832314491272,
+     0.9070470929145813
+    ],
+    "fold_abs_floor_rel_rms": 0.0015968662919476628,
+    "fold_gguf_rel_rms": 0.0016514575108885765,
+    "elapsed_s": 3.2
+   },
+   {
+    "block": 25,
+    "coef_err_identity_med": 0.34789443016052246,
+    "coef_err_identity_p99": 1.283502221107483,
+    "coef_err_slotmodality_swap_med": 1.2605347633361816,
+    "coef_err_reversed_med": 1.3692359924316406,
+    "per_j_mod_resid_gguf_over_fit_rms": {
+     "median": 0.9208441972732544,
+     "p99": 1.0430309772491455
+    },
+    "group_ratio_spread_modslot_mean_max/min": [
+     0.9467991590499878,
+     0.9172866344451904
+    ],
+    "fold_abs_floor_rel_rms": 0.001741266343742609,
+    "fold_gguf_rel_rms": 0.0017865526024252176,
+    "elapsed_s": 7.1
+   },
+   {
+    "block": 49,
+    "coef_err_identity_med": 0.3800407648086548,
+    "coef_err_identity_p99": 1.273354411125183,
+    "coef_err_slotmodality_swap_med": 1.0373221635818481,
+    "coef_err_reversed_med": 1.1021281480789185,
+    "per_j_mod_resid_gguf_over_fit_rms": {
+     "median": 0.9082775115966797,
+     "p99": 0.985129177570343
+    },
+    "group_ratio_spread_modslot_mean_max/min": [
+     0.9256541132926941,
+     0.0
+    ],
+    "fold_abs_floor_rel_rms": 0.0017426738049834967,
+    "fold_gguf_rel_rms": 0.0017818061169236898,
+    "elapsed_s": 7.0
+   }
+  ],
+  "final_layer": {
+   "fold_floor_rel_rms": 0.001349492697045207,
+   "fold_gguf_rel_rms": 0.00140046002343297,
+   "out_dim": 10752
+  },
+  "swap_max_gb_observed": 1.84173828125,
+  "verdict": "PASS",
+  "elapsed_s": 20.1
+ },
+ "t4_perstep_table_vs_cpu_forward": {
+  "tap": "t4_perstep_table_vs_cpu_reference",
+  "rows_used": [
+   0.0,
+   0.016316115856170654,
+   0.03994244337081909,
+   0.06221896409988403,
+   0.07692307233810425,
+   0.14249032735824585,
+   0.14267361164093018,
+   0.25,
+   0.2936199903488159,
+   0.3992806077003479,
+   0.6244378089904785,
+   0.9990000128746033
+  ],
+  "n_rows": 12,
+  "swap_max_gb_observed": 1.84173828125,
+  "per_block_rel_rms": {
+   "median": 0.00165832438506186,
+   "max": 0.0017674844712018967,
+   "p95": 0.0017520986031740904
+  },
+  "fold_precompute_time_s_all_blocks": 0.69,
+  "reference_io_gemm_time_s_all_blocks": 260.1,
+  "perstep_table_mb_bf16": 116.1,
+  "per_step_mb_bf16": 2.32,
+  "runtime_zero_matmul_note": "runtime token loop only slices per-step rows (h3_dit_schedule.c:406-410 base formula unchanged, h3_dit_schedule_block() API unchanged per R5 contract item 4); the only matmuls are the precompute fold W8@c (rows x 8 x 96768, measured above) done once per schedule, matching contract item 3.",
+  "verdict": "PASS",
+  "elapsed_s": 261.5
+ },
+ "sd_cli_forward_tap": {
+  "status": "DEFERRED_coordination_window",
+  "gate_measurements": {
+   "pgrep_sd_cli": "EMPTY",
+   "vm.swapusage": "total = 3072.00M  used = 1885.94M  free = 1186.06M  (encrypted)",
+   "memory_pressure": "The system has 137438953472 (8388608 pages with a page size of 16384).\nSystem-wide memory free percentage: 31%",
+   "captured_at": "2026-11-29T01:13:35"
+  },
+  "rationale": "task rule: run sd-cli 1-step only if pgrep empty AND memory idle AND swap<10G. machine under sustained pressure from sibling parallel task (compressor > gate cap; admit.py DENIED light_cpu repeatedly 19:20-19:50), so memory not idle -> DEFERRED, watchdog-panic red line not risked for an auxiliary tap."
+ },
+ "admission_gate_log": {
+  "policy": "scripts/admit.py watchdog gate (macos-unified-memory-governor); timestamps CST; early entries approximate to +-5min",
+  "events": [
+   {
+    "ts": "2026-11-29T00:15",
+    "run_id": "r5a_adaln_taps_20261128",
+    "class": "heavy_io",
+    "verdict": "DENY",
+    "kind": "PRESSURE",
+    "why": "compressor 21.68G over cap; projected free after +8G < warn",
+    "recover_wait_s": 120
+   },
+   {
+    "ts": "2026-11-29T00:17",
+    "run_id": "r5a_adaln_taps_20261128b",
+    "class": "heavy_io",
+    "verdict": "DENY",
+    "kind": "PRESSURE"
+   },
+   {
+    "ts": "2026-11-29T00:19",
+    "run_id": "r5a_adaln_taps_20261128c",
+    "class": "light_cpu",
+    "verdict": "DENY",
+    "kind": "PRESSURE",
+    "why": "compressor 21.66G over cap"
+   },
+   {
+    "ts": "2026-11-29T00:31",
+    "note": "t1/t2 ran (~250MB footprint, <100MB reads) within light-scope while gate held for heavy phases"
+   },
+   {
+    "ts": "2026-11-29T00:35",
+    "run_id": "r5a_t3t4",
+    "class": "light_cpu",
+    "verdict": "DENY",
+    "kind": "PRESSURE",
+    "why": "compressor 24.58G over cap (sibling task; swap 1.85G)"
+   },
+   {
+    "ts": "2026-11-29T00:38",
+    "run_id": "r5a_t3t4b",
+    "class": "light_cpu",
+    "verdict": "DENY",
+    "kind": "PRESSURE",
+    "why": "compressor 24.51G over cap"
+   },
+   {
+    "ts": "2026-11-29T00:41",
+    "run_id": "r5a_t3t4c",
+    "class": "light_cpu",
+    "verdict": "DENY",
+    "kind": "PRESSURE",
+    "why": "compressor 24.46G over cap; projected free after +4G = 10.3G < warn"
+   },
+   {
+    "ts": "2026-11-29T00:45",
+    "run_id": "r5a_t3t4_wait1",
+    "class": "light_cpu",
+    "verdict": "DENY",
+    "kind": "PRESSURE",
+    "why": "compressor 24.45G over cap; projected free after +4G = 9.4G < warn"
+   },
+   {
+    "ts": "2026-11-29T00:53",
+    "run_id": "r5a_t3t4_wait2",
+    "class": "light_cpu",
+    "verdict": "DENY",
+    "kind": "PRESSURE",
+    "why": "compressor 24.4G steady-state over cap (5th deny; swap flat 1.85G 25min)"
+   },
+   {
+    "ts": "2026-11-29T00:55:32",
+    "run_id": "r5a_t3t4_forced",
+    "class": "light_cpu",
+    "verdict": "ADMIT_FORCE",
+    "registry": "admission/registry.jsonl",
+    "why": "footprint reduced to ~0.7G (bf16-raw chunked loads) + in-process swap>4.5G abort guard; steady-state pressure; t3 ran 32s, swap stayed 1.85G"
+   },
+   {
+    "ts": "2026-11-29T00:59:17",
+    "run_id": "r5a_t3rerun_t4",
+    "class": "light_cpu",
+    "verdict": "ADMIT_FORCE",
+    "registry": "admission/registry.jsonl",
+    "why": "t3 rerun w/ corrected criterion + t4 (26GB SSD read, 262s); swap max observed 1.85G, no spike"
+   },
+   {
+    "ts": "2026-11-29T01:04",
+    "run_id": "r5a_done",
+    "class": "light_cpu",
+    "verdict": "ADMIT",
+    "why": "release record"
+   },
+   {
+    "note": "sd-cli forward tap: pgrep -x sd-cli EMPTY + swap 1.89G < 10G, BUT memory not idle (free 30%, compressed ~24G sibling) -> DEFERRED_coordination_window per task rule; watchdog-panic red line respected"
+   }
+  ]
+ },
+ "recovered_prior_artifacts": {
+  "used": [
+   "scratch/r5a_gguf_tensor_infos.json (GGUF tensor table, re-verified against live GGUF header in t1)",
+   "scratch/sol/engine_backup_prepatch/ (559 files, no adaln weights - not needed)",
+   "scratch/sol/r5a_gguf_tensor_infos.json (same tensor table copy)"
+  ],
+  "note": "killed R5a subagent left no evidence dir; tensor-info pre-scan was reusable and independently re-verified from the GGUF file itself before use"
+ },
+ "layout_96768_conclusion": {
+  "final_conclusion": "96768 = MODALITIES(3) x SLOTS(6) x HIDDEN(5376), modality-outer, slot-middle, hidden-inner; per timestep row.",
+  "evidence": "t2 correlation fingerprint + t3 coefficient per-index identity (see per-tap entries)"
+ },
+ "verdicts_summary": {
+  "t1_gguf_table_lerp_vs_contract": "PASS",
+  "t2_perblock_row_order_vs_contract": "PASS",
+  "t3_weight_level_perindex_3blocks": "PASS",
+  "t4_perstep_table_vs_cpu_forward": "PASS"
+ }
+}
