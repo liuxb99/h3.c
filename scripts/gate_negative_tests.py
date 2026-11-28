@@ -23,13 +23,14 @@ Sandbox dir is wiped and rebuilt at every start (idempotent). Exit 0 iff all
 six rows behave as expected.
 
 KNOWN GATE-TRIAGE QUIRKS (observed, verdicts unaffected — gate left unmodified
-per task discipline): qkv_layout_gate.classify_permutation reshapes the flat
-code payload to [N,K] and then np.sort-sorts ROW-WISE, not as one global
-multiset, and requant_ref pre-permutes the reference codes to grouped order;
-so the diagnostic tag is unreliable for the cases it labels — M1 (row
-permutation) tags QUANT_DRIFT (true global-multiset diff is 0.0 => should be
-PERMUTATION), M2 (scale error, codes untouched) tags PERMUTATION. The FAIL
-verdicts and numeric measurements are correct regardless.
+per task discipline): qkv_layout_gate.classify_permutation once sorted the
+flat code payload ROW-WISE instead of as one global multiset (and requant_ref
+pre-permutes the reference codes to grouped order), making the diagnostic tag
+unreliable: M1 (row permutation) tagged QUANT_DRIFT though its true global
+multiset diff is 0.0. FIXED 2026-11-28: classify now flat-sorts both sides,
+so PERMUTATION means "payload multiset preserved" (row reorder, scale-only
+error, or equivalent requant). The FAIL verdicts and numeric measurements
+were always correct.
 
 Run (CPU only):
   cd <repo root> && uv run --python 3.11 --with torch,numpy -q python \

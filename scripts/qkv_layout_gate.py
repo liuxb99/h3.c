@@ -26,8 +26,10 @@ Checks:
        cos >= --cos-min (0.999), relRMS <= --relrms-max (0.05).
        On failure: multiset triage — sorted(u8 codes) of candidate vs sorted
        codes of the reference requantized with the pinned f32 line; mismatch
-       fraction < --multiset-tol => tag PERMUTATION (row reorder, not
-       quantization), else QUANT_DRIFT.
+       fraction < --multiset-tol => tag PERMUTATION (payload multiset
+       preserved: row reorder, scale-sidecar-only error, or equivalent
+       requant — global flat sort, 2026-11-28 fix: was per-row sort),
+       else QUANT_DRIFT.
 
 BF16->F32 is bit-exact (u16 << 16). A reference may be BF16/F32 float or
 itself convrot (I8 dequantized with its own scales).
@@ -257,8 +259,8 @@ def main():
             codes = cand.codes_i8(subj)
             if codes.ndim == 1:  # codes_i8 returns the flat payload
                 codes = codes.reshape(rc.shape)
-            codes = np.sort(codes.astype(np.uint16) + 128)
-            rcs = np.sort(rc.astype(np.uint16) + 128)
+            codes = np.sort(codes.astype(np.uint16).ravel() + 128)
+            rcs = np.sort(rc.astype(np.uint16).ravel() + 128)
             if codes.shape != rcs.shape:
                 return "MULTISET_SHAPE", float("nan")
             diff = float((codes != rcs).mean())
