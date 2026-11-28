@@ -1,0 +1,43 @@
+{
+  "classes": {
+    "light_cpu": {
+      "est_gb": 4,
+      "min_free_pct": 25,
+      "mutex": false
+    },
+    "heavy_io": {
+      "est_gb": 8,
+      "min_free_pct": 35,
+      "mutex": true
+    },
+    "big_diff": {
+      "est_gb": 16,
+      "min_free_pct": 40,
+      "mutex": true,
+      "require_streaming": true
+    },
+    "heavy_build": {
+      "est_gb": 14,
+      "min_free_pct": 45,
+      "mutex": true
+    },
+    "heavy_gpu": {
+      "est_gb": 20,
+      "min_free_pct": 55,
+      "mutex": true,
+      "gpu_gb": 80
+    }
+  },
+  "gpu_cap_gb": 100.0,
+  "resident_gpu_gb": {
+    "strata": 0.0,
+    "comfyx_service": 24.0,
+    "h3_native_int8": 80.0,
+    "comfyx_active_pipeline": 40.0
+  },
+  "swap_used_warn_gb": 12.0,
+  "swap_used_block_gb": 30.0,
+  "swap_rate_block_gb_per_min": 2.0,
+  "compressor_block_mb": 8000,
+  "recover_wait_s": 120
+}

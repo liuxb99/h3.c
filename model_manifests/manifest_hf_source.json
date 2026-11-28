@@ -1,0 +1,26 @@
+{
+  "asset_id": "hf_original_sources",
+  "role": "read_only_HF_sources (golden reference; DO NOT write)",
+  "compatible_engines": ["reference_only (eager python, converter input)"],
+  "layout_contract": {
+    "fused_qkv_passthrough": "per_head_interleaved (canonical)",
+    "note": "HF original stores fused qkv rows per-head interleaved — engine h3_weights.c layout rule H3_DIT_QKV_LAYOUT_ROWS"
+  },
+  "quant_method": "bf16 original (MiniMaxAI); eager int8 pack (FL2VA_pruned, D-golden comparison source)",
+  "assets": [
+    {
+      "name": "MiniMax-H3_FFlex_ref2va_HF",
+      "path": "/Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3-flex-ref2va/Ref2VA/transformer",
+      "expected_sha256": "PENDING_hf_dir_agg",
+      "read_only": false
+    },
+    {
+      "name": "MiniMax-H3_FL2VA_bf16_13shards",
+      "path": "/Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3/FL2VA/transformer",
+      "expected_sha256": "PENDING_hf_dir_agg",
+      "read_only": false
+    }
+  ],
+  "known_defects": [],
+  "recorded_at": "2026-11-28T01:30:00+08:00"
+}

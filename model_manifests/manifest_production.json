@@ -1,0 +1,43 @@
+{
+  "asset_id": "comfyx_production_set",
+  "role": "ComfyX production models (ComfyUI port 8390; never touched by h3c patch \u2014 verified via inode/mtime/lsof 2026-11-28)",
+  "compatible_engines": [
+    "comfy_core_piflow (mmap, resident since ~12:40 2026-11-27)"
+  ],
+  "layout_contract": {
+    "note": "self-consistent within comfy_core slicing semantics; grouped row blocks; never rewritten by h3c pipeline"
+  },
+  "quant_method": "int8_convrot + nvfp4_awq TE + int8 convrot vae/lora",
+  "assets": [
+    {
+      "name": "fl2va_pruned_int8_convrot",
+      "path": "/Users/cyliu99/ComfyUI-Shared/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "expected_sha256": "e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a",
+      "size_bytes": 20970379616,
+      "read_only": false
+    },
+    {
+      "name": "pi_h3_4step_dwd_adapter_int8_convrot",
+      "path": "/Users/cyliu99/ComfyUI-Shared/models/loras/pi-H3/pi_h3_4step_dwd_adapter_int8_convrot.safetensors",
+      "expected_sha256": "a2fa1caae2cd4a12f85cc3eccd2a360fe9dabf430623d47deca619605e96ee6d",
+      "size_bytes": 2192176240,
+      "read_only": false
+    },
+    {
+      "name": "minimax_h3_video_vae_int8_convrot",
+      "path": "/Users/cyliu99/ComfyUI-Shared/models/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+      "expected_sha256": "52a2c8c73583c86e4f41cdcce3a6ad0ea562987bc0bf3d60a0cef5f5c8e60c0e",
+      "size_bytes": 2811065184,
+      "read_only": false
+    },
+    {
+      "name": "qwen3vl_32b_te_nvfp4_awq",
+      "path": "/Users/cyliu99/ComfyUI-Shared/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "expected_sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6",
+      "size_bytes": 15687142551,
+      "read_only": false
+    }
+  ],
+  "known_defects": [],
+  "recorded_at": "2026-11-27T17:23:55+00:00"
+}

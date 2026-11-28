@@ -1,0 +1,44 @@
+{
+  "asset_id": "h3c_built_convrot_from_hf",
+  "role": "h3c_native_engine_weights_built_from_HF_golden_by_scripts_build_int8_convrot",
+  "compatible_engines": [
+    "h3c_native_metal (engine copy convrot_engine_patched as compatibility baseline)"
+  ],
+  "layout_contract": {
+    "main_block_fused_qkv_i8": "grouped_rows_engine_rowmap (quantized in grouped row order; per-head-interleaved HF rows permuted at emit)",
+    "passthrough_bf16": "HF_canonical_bytes_verbatim (no dequant/requant roundtrip)",
+    "sidecar_order": "weight -> weight_scale -> comfy_quant interleaved per subject (header key order = engine h3_weights.c resolution order)",
+    "scale_semantics": "sidecar scales carried VERBATIM from official contract file (official is the engine-dequant compatibility baseline); codes recomputed from HF via verified conference-h4 bf16 f32 line"
+  },
+  "quant_method": "int8_convrot (conference-h4 kron-power /sqrt(G) rotation, bf16 matmul line, scale=clamp(absmax_rot/127,1e-30) rowwise F32 [N,1], groupsize per comfy_quant 64/256)",
+  "assets": [
+    {
+      "name": "minimax_h3_ref2va_int8_convrot_h3c",
+      "path": "/Volumes/SSD2T/models/MiniMax-H3-h3c-built/minimax_h3_ref2va_int8_convrot_h3c.safetensors",
+      "expected_sha256": "dd098ba96263fd29a75a11b249688e696cbf523007260f61aa9e78d8711ffeeb",
+      "size_bytes": 34038912128,
+      "read_only": false,
+      "build_pending": false,
+      "verified_note": "double-run repro 2026-11-28: build1==build2 byte-identical (scratch/sol/built1_sha.json + built2_sha.json + repro_compare.json verdict PASS, 1035/1035 tensors identical)",
+      "passthrough_manifest": "scratch/sol/built_passthrough_manifest.json",
+      "hf_source_dir": "/Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3-flex-ref2va/Ref2VA/transformer"
+    },
+    {
+      "name": "h3c_built_FL2VA_symlink",
+      "path": "/Volumes/SSD2T/models/MiniMax-H3-h3c-built/FL2VA",
+      "expected_sha256": "PENDING_symlink_to_/Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3/FL2VA",
+      "read_only": true,
+      "build_pending": false,
+      "freeze_pending": true,
+      "verified_note": "symlink exists 2026-11-28 and resolves to /Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3/FL2VA (target dir present; directory, not sha-hashed). uchg set ON THE LINK ITSELF (chflags -h); audit st follows to target dir whose freeze lives in manifest_hf_source.json scope"
+    }
+  ],
+  "lineage": {
+    "hf_source": "/Volumes/SSD2T/models/MiniMaxAI/MiniMax-H3-flex-ref2va/Ref2VA/transformer (golden, only truth)",
+    "contract_scale_source": "/Volumes/SSD2T/models/MiniMax-H3-comfy-int8/minimax_h3_ref2va_int8_convrot.safetensors @ frozen HF-canonical official (sha recorded scratch/sol/official_sha_new.txt in chain_record1.log)",
+    "converter": "scripts/build_int8_convrot.py @ repo h3c_mac_20261125 (single-pass stream builder, 2026-11-28 generation: quant codes recomputed from HF, scale+comfy verbatim from contract, qkv emitted grouped)",
+    "repro_protocol": "build1 -> whole+per-tensor sha manifest -> delete -> build2 fresh -> match (scratch/sol/repro_compare.json)"
+  },
+  "known_defects": [],
+  "recorded_at": "2026-11-28T04:40:00+08:00"
+}
